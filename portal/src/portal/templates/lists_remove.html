@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Remove from {{ label }}{% endblock %}
+{% block main %}
+<h1>Remove {{ value }}?</h1>
+<p>It comes off <strong>{{ label }}</strong>. The analyzer stops using it within a minute.{% if from_file %} It's in your lists file on the host, which stays as it is: the portal remembers the removal, and you can restore it from this page later.{% endif %}</p>
+<form method="post" action="/lists/remove" class="inline">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirm" value="yes">
+  <input type="hidden" name="list" value="{{ list }}"><input type="hidden" name="index" value="{{ index }}"><input type="hidden" name="value" value="{{ value }}">{% if from_file %}<input type="hidden" name="source" value="file">{% endif %}
+  <button class="primary">Remove {{ value }}</button>
+</form>
+<a href="/lists" class="spaced">Cancel</a>
+{% endblock %}

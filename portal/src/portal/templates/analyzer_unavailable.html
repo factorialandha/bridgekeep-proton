@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}{{ title }}{% endblock %}
+{% block main %}
+<h1>{{ title }}</h1>
+{% if why == "not_set_up" %}
+<p>The analyzer hasn't written a decision log yet.</p>
+<p class="sub">If it isn't set up, run <code>./bridgekeep setup</code> and answer yes to the analyzer question. If it is, the log appears after its first check of your inbox.</p>
+{% elif why == "schema" %}
+<p>The analyzer's log is from a different version than this portal understands, so the portal won't guess at it.</p>
+<p class="sub">Update both together: <code>./bridgekeep update</code>.</p>
+{% else %}
+<p>The analyzer's log is busy right now. Reload the page in a few seconds.</p>
+<p class="sub">If this keeps happening, run <code>./bridgekeep doctor</code>.</p>
+{% endif %}
+{% endblock %}

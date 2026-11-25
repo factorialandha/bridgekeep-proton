@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block title %}Unsubscribe{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/log">Log</a> / <a href="/log/entry?id={{ rid }}">Entry</a> / Unsubscribe</p>
+{% if out is none %}
+<h1>Unsubscribe from this sender?</h1>
+<p>Bridgekeep will use the sender's one-click unsubscribe link once, on your behalf. It contacts <code>{{ host }}</code>, the address named in the sender's own message (Bridgekeep checked it matches the sender's signature), and sends nothing about you except that request.</p>
+<p class="sub">From <span class="mono">{{ sender }}</span>. Some senders take a few days to stop.</p>
+<form method="post" action="/unsubscribe" class="inline">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ rid }}"><input type="hidden" name="confirm" value="yes">
+  <button class="primary">Unsubscribe</button>
+</form>
+<a href="/log/entry?id={{ rid }}" class="spaced">Cancel</a>
+{% else %}
+{% if out.result == "done" %}
+<h1>Unsubscribed</h1>
+<p class="ok" role="status">✓ <code>{{ host }}</code> accepted the request.</p>
+{% elif out.result == "refused" %}
+<h1>Not sent</h1>
+<p class="nudge" role="alert">Bridgekeep didn't send it: {{ (out.detail or "the link didn't pass its safety checks").rstrip(".") }}.</p>
+<p class="sub">You can use the unsubscribe link in the message from your mail app instead.</p>
+{% else %}
+<h1>That didn't work</h1>
+<p class="nudge" role="alert">{{ out.detail or "The sender's server didn't accept the request." }}</p>
+<p class="sub">You can try again later, or use the unsubscribe link in the message from your mail app.</p>
+{% endif %}
+<p><a href="/log/entry?id={{ rid }}">Back to the log entry</a></p>
+{% endif %}
+{% endblock %}

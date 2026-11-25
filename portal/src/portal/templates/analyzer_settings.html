@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block title %}Analyzer{% endblock %}
+{% block main %}
+<h1>Analyzer</h1>
+<p class="lead">How the analyzer decides, how much it may spend on the AI, and how often it checks for mail.</p>
+{% if done == "secret-sent" %}<p class="ok" role="status">✓ Sent to the host. It's applied within 5 minutes, and your Discord channel (if set up) is told first.</p>{% endif %}
+{% if done == "saved" %}<p class="ok" role="status">✓ Saved. The analyzer uses the new settings from its next check, within {{ s["imap.poll_seconds"] | int }} seconds.</p>{% endif %}
+{% include "_error.html" %}
+{% if not writable %}<p class="nudge" role="alert">The portal can't save changes yet: its settings folder isn't set up. Run <code>./bridgekeep setup</code> on the host.</p>{% endif %}
+{% for p in problems %}<p class="nudge" role="alert">The analyzer ignored a setting: {{ p }}</p>{% endfor %}
+
+{% if done == "shadow" %}<p class="ok" role="status">✓ Back to shadow mode. The analyzer stops moving mail at its next check.</p>{% endif %}
+{% if done == "live" %}<p class="ok" role="status">✓ Live mode is on. The analyzer starts moving mail at its next check.</p>{% endif %}
+<h2 class="section" id="mode">Mode</h2>
+{% set live_now = health.mode == "live" %}{% set lv = health.live if health.live is defined else {} %}{% set can_live = health.live_available is defined and health.live_available %}
+<p>Now: {% if live_now %}<span class="badge trash">Live</span> The analyzer moves mail.{% else %}<span class="badge safe">Shadow</span> The analyzer only logs what it would do. Nothing is moved.{% endif %}
+{% if live_requested and not live_now and not lv.get("problem") %}<span class="sub">Live mode is switched on and starts at the analyzer's next check.</span>{% endif %}
+{% if live_now and lv.get("moved_today") is not none %}<span class="sub">Moved today: {{ "{:,}".format(lv.get("moved_today")) }}{% if lv.get("move_cap") is not none %} of at most {{ "{:,}".format(lv.get("move_cap")) }}{% endif %}{% if lv.get("moved_back_today") %}, {{ "{:,}".format(lv.get("moved_back_today")) }} moved back{% endif %}.</span>{% endif %}</p>
+{% if lv.get("problem") %}<p class="nudge" role="alert">Live mode isn't running: {{ lv.get("problem") }}</p>{% endif %}
+<div class="inline">
+  <form method="post" action="/analyzer/mode" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="mode" value="shadow">
+    <button {{ 'aria-pressed="true"' if not (live_requested or live_now) else "" }} {{ "disabled" if not writable or not (live_requested or live_now) }}>Shadow (log only)</button>
+  </form>
+  <form method="post" action="/analyzer/live" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="back" value="/analyzer">
+    <button {{ 'aria-pressed="true"' if live_requested or live_now else "" }} {{ "disabled" if not writable or not can_live or live_requested or live_now }}>Live (move mail)</button>
+  </form>
+</div>
+{% if not can_live %}<p class="hint">Live isn't available yet: this version of the analyzer can only log. The button turns on by itself after an update that adds live moves. Until then, use the Log and your Not spam / Spam answers to see how it would do.</p>
+{% else %}<p class="hint">Going live asks you to confirm and for your password. Switching back to shadow is one click.</p>{% endif %}
+
+<section class="group" aria-labelledby="g-ai">
+<h2 class="section" id="g-ai">AI</h2>
+<p>{{ vendor_label }}{% if vendor_model %} · <code>{{ vendor_model }}</code>{% endif %} · <a href="/analyzer/vendor">Change vendor or model</a></p>
+{% if spend is not none and budget %}
+<p class="spend"><span>This month: <strong class="num">${{ "%.2f" | format(spend) }}</strong> of ${{ budget | round | int }}</span>
+<meter min="0" max="{{ budget }}" low="{{ budget * 0.7 }}" high="{{ budget * 0.9 }}" optimum="0" value="{{ spend }}" aria-hidden="true"></meter></p>
+{% endif %}
+{% if vendor == "anthropic" %}
+{% set k = secrets.anthropic_api_key %}
+<h3 id="api-key">Claude API key</h3>
+{% if key_error %}<p class="error" role="alert">{{ key_error }}</p>{% endif %}
+<p>
+  {% if k.pending %}<span class="badge review">! Waiting for the host</span> <span class="sub">Applied within 5 minutes.</span>
+  {% elif k.on %}<span class="badge safe">✓ Set</span> ending <code>…{{ k.last4 }}</code>{% if k.when %} <span class="sub">· changed {{ k.when | ago }}</span>{% endif %}
+  {% else %}<span class="badge muted">Not set</span> <span class="sub">The analyzer runs on your lists and rules only.</span>{% endif %}
+</p>
+{% if k.result and k.result != "ok" and not k.pending %}<p class="nudge" role="alert">The host didn't apply the last change: {{ k.result }}</p>{% endif %}
+{% if k.on %}<details class="advanced" {{ "open" if key_error }}><summary>Replace or remove the key</summary>{% endif %}
+<form method="post" action="/secrets/set" class="narrow" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="name" value="anthropic_api_key">
+  <label for="api-key-value">{{ "New key" if k.on else "Key" }}</label>
+  <input id="api-key-value" name="value" type="password" autocomplete="off" spellcheck="false" maxlength="220" placeholder="sk-ant-…" required>
+  <p class="hint">Make a key just for Bridgekeep in the Anthropic Console, with a spend limit. The portal never shows it again: the host installs it and keeps only the last 4 characters here. One change every 10 minutes.</p>
+  <button class="primary" {{ "disabled" if not drop_writable or k.pending }}>{{ "Replace the key" if k.on else "Save the key" }}</button>
+</form>
+{% if k.on %}
+<form method="post" action="/secrets/remove" class="inline spaced">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="name" value="anthropic_api_key">
+  <button class="ghost" {{ "disabled" if not drop_writable or k.pending }}>Remove the key (rules and lists only)</button>
+</form>
+{% endif %}
+{% if k.on %}</details>{% endif %}
+{% if not drop_writable %}<p class="sub">Run <code>./bridgekeep setup</code> on the host to enable this.</p>{% endif %}
+{% else %}
+<h3 id="api-key">API key</h3>
+<p>To change the key for {{ vendor_label }}, use <a href="/analyzer/vendor">AI vendor</a> with the same vendor and model.</p>
+{% endif %}
+</section>
+
+<form method="post" action="/analyzer/settings" class="narrow">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+
+  <h2 class="section">Spending</h2>
+  <label class="check"><input type="checkbox" name="model_enabled" {{ "checked" if s["model.enabled"] in (true, "on") }}> Use the AI</label>
+  <p class="hint">Off: only your lists and the built-in rules decide. No mail is sent to {{ vendor_label }}.</p>
+  <label for="model_monthly_budget_usd">Monthly budget (US$)</label>
+  <input id="model_monthly_budget_usd" name="model_monthly_budget_usd" type="number" min="0" max="1000" step="1" value="{{ s['model.monthly_budget_usd'] }}" required>
+  <p class="hint">Reached: rules only until the 1st. Up to $1,000.</p>
+
+  <h2 class="section">How strict</h2>
+  <div class="slider">
+    <label for="thresholds_quarantine">Trash when the AI is this sure it's spam</label>
+    <output for="thresholds_quarantine" id="q-out" class="num">{{ s['thresholds.quarantine'] }}%</output>
+    <input id="thresholds_quarantine" name="thresholds_quarantine" type="range" min="50" max="100" step="1" value="{{ s['thresholds.quarantine'] }}" data-out="q-out">
+  </div>
+  <p class="hint">Default 97.{% if mode == "shadow" %} While the analyzer only logs, this changes what the log says it would do.{% endif %}</p>
+  <div class="slider">
+    <label for="thresholds_review">Send to Review when it's this sure</label>
+    <output for="thresholds_review" id="r-out" class="num">{{ s['thresholds.review'] }}%</output>
+    <input id="thresholds_review" name="thresholds_review" type="range" min="30" max="100" step="1" value="{{ s['thresholds.review'] }}" data-out="r-out">
+  </div>
+  <p class="hint">Default 70. Less sure than this, mail is left alone. It must be lower than the Trash level.</p>
+  {% if checked %}
+  <p class="preview" id="preview" data-scores="{{ scores }}" aria-live="polite">Last 14 days at these settings: of {{ checked }} messages the AI scored, <strong class="num" data-would="trash">{{ would.trash }}</strong> would be trashed and <strong class="num" data-would="review">{{ would.review }}</strong> sent to Review.</p>
+  {% endif %}
+
+  <details class="advanced">
+    <summary>Advanced: limits and how often it checks</summary>
+    <label for="limits_max_per_hour">AI checks per hour, at most</label>
+    <input id="limits_max_per_hour" name="limits_max_per_hour" type="number" min="1" max="10000" step="1" value="{{ s['limits.max_per_hour'] }}" required>
+    <label for="limits_max_per_day">AI checks per day, at most</label>
+    <input id="limits_max_per_day" name="limits_max_per_day" type="number" min="1" max="100000" step="1" value="{{ s['limits.max_per_day'] }}" required>
+    <p class="hint">Past a limit, new mail is handled by rules only until the hour or day is over. Defaults 120 and 1,000.</p>
+    <label for="limits_max_moves_per_day">Mail moves a day in live mode, at most</label>
+    <input id="limits_max_moves_per_day" name="limits_max_moves_per_day" type="number" min="0" max="5000" step="1" value="{{ s['limits.max_moves_per_day'] }}" required>
+    <p class="hint">Past it, the analyzer only logs until tomorrow and tells you on Discord. Default 200. 0 means it never moves mail.</p>
+    <label for="imap_poll_seconds">Check for new mail every (seconds)</label>
+    <input id="imap_poll_seconds" name="imap_poll_seconds" type="number" min="15" max="3600" step="1" value="{{ s['imap.poll_seconds'] }}" required>
+    <p class="hint">Default 60. Between 15 and 3,600.</p>
+  </details>
+
+  <p class="hint">Saving asks for your password if you haven't confirmed it in the last 5 minutes.</p>
+  <button class="primary" {{ "disabled" if not writable }}>Save</button>
+</form>
+
+<h2 class="section">Older mail</h2>
+<p>Mail from before setup is left alone unless you ask. <a href="/backfill">Estimate the cost of analyzing it</a>.</p>
+{% endblock %}

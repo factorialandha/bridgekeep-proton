@@ -1,0 +1,328 @@
+# Proton Mail Bridge, headless.
+#
+#   make build                                # build the image from the pinned .deb
+#   docker compose run --rm bridge-init       # one-time interactive login
+#   docker compose up -d                      # run
+#
+# Nothing is published on the host (no `ports:`; Docker's published ports
+# bypass host firewalls such as ufw). Other containers reach Bridge by joining
+# the `mail` network and connecting to bridge:1143 (IMAP). SMTP (bridge:1025)
+# is off by default; set BRIDGE_FORWARD_SMTP=true to turn it on.
+#
+# The AI analyzer is opt-in and log-only (it moves nothing):
+#   make analyzer-build analyzer-init         # image, config/ and the secrets
+#   docker compose --profile analyzer up -d
+# It reaches Bridge only through imap-proxy (read-only command allowlist; the
+# analyzer never sees the Bridge password) and the internet only through
+# egress-proxy (the chosen AI vendor's one host only, api.anthropic.com:443 by
+# default). See analyzer/README.md.
+#
+# The admin portal is opt-in too (portal/README.md):
+#   docker compose --profile portal up -d     # then open http://localhost:8443
+# It listens on 127.0.0.1 only, has no route to the internet, never joins the
+# mail network and never sees a Proton or Bridge password.
+
+name: proton-bridge
+
+x-hardening: &hardening
+  image: ${BRIDGE_IMAGE:-proton-bridge:local}
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  mem_limit: ${BRIDGE_MEM_LIMIT:-1g}
+  pids_limit: 256
+  volumes:
+    - bridge-data:/home/bridge
+
+# Shared by imap-proxy, egress-proxy and analyzer: one image, three roles.
+x-analyzer-hardening: &analyzer-hardening
+  image: ${ANALYZER_IMAGE:-proton-analyzer:local}
+  build: analyzer
+  profiles: [analyzer]
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 64
+  volumes:
+    - ./config:/config:ro
+
+services:
+  bridge:
+    <<: *hardening
+    # `make build` passes the pins; `docker compose --env-file bridge-version.env build` also works.
+    build:
+      context: .
+      args:
+        BRIDGE_BUILD: ${BRIDGE_BUILD:-source}
+        BRIDGE_VERSION: ${BRIDGE_VERSION:-}
+        BRIDGE_DEB_SHA256: ${BRIDGE_DEB_SHA256:-}
+        BRIDGE_SIGNING_KEY: ${BRIDGE_SIGNING_KEY:-}
+        BRIDGE_SOURCE_H1: ${BRIDGE_SOURCE_H1:-}
+        BRIDGE_SOURCE_COMMIT: ${BRIDGE_SOURCE_COMMIT:-}
+        GO_TOOLCHAIN: ${GO_TOOLCHAIN:-}
+    restart: unless-stopped
+    environment:
+      # socat listens only on the `mail` network address, never on `egress`.
+      FORWARD_BIND_ADDRS: ${BRIDGE_MAIL_IP:-172.31.253.10}
+      FORWARD_IMAP: ${BRIDGE_FORWARD_IMAP:-true}
+      FORWARD_SMTP: ${BRIDGE_FORWARD_SMTP:-false}   # off: the analyzer only needs IMAP
+      BRIDGE_LOG_LEVEL: ${BRIDGE_LOG_LEVEL:-info}
+      # Sign-in broker (broker/): lets the admin portal sign Bridge in.
+      BROKER_GID: "10010"       # the socket's group: bridge and portal only
+      BROKER_CRED_GID: "10011"  # the saved Bridge password's group: bridge and imap-proxy only
+      BROKER_PEER_UIDS: "10003" # the portal's user; nobody else may use the socket
+    group_add: ["10010", "10011"]
+    volumes:
+      - bridge-data:/home/bridge
+      - broker-sock:/run/broker                  # the broker's socket, shared with the portal
+      - bridge-credential:/run/bridge-credential # the Bridge password, shared with imap-proxy only
+    networks:
+      egress: {}                # outbound to Proton's API only
+      mail:
+        ipv4_address: ${BRIDGE_MAIL_IP:-172.31.253.10}
+        aliases: [bridge]
+    stop_grace_period: 30s
+
+  # One-shot interactive login. Its output is NOT sent to docker logs,
+  # because the CLI `info` command prints the Bridge password.
+  # Stop `bridge` first: docker compose stop bridge
+  bridge-init:
+    <<: *hardening
+    profiles: [init]
+    command: ["init"]
+    # The image's healthcheck would probe the CLI's IMAP/SMTP ports every 30s
+    # and add noise to the login session. It means nothing here.
+    healthcheck:
+      disable: true
+    stdin_open: true
+    tty: true
+    restart: "no"
+    logging:
+      driver: none
+    networks:
+      egress: {}
+
+  # -- AI analyzer (profile "analyzer") ------------------------------------
+
+  imap-proxy:
+    <<: *analyzer-hardening
+    command: ["imap-proxy"]
+    mem_limit: 128m
+    depends_on: [bridge]
+    secrets: [bridge_password, analyzer_imap_token]
+    group_add: ["10011"]        # reads the Bridge password the broker saves
+    volumes:
+      - ./config:/config:ro
+      - bridge-credential:/run/bridge-credential:ro   # after a sign-in from the portal
+      - ${BRIDGEKEEP_NOTIFY_DIR:-/var/lib/bridgekeep/notify}/spool/analyzer:/run/bridgekeep/alerts   # alerts out (docs/alerts.md)
+      # Live mode: the proxy reads mode.json and PAUSE itself, before every move
+      # (a folder mount, so the portal's atomic replace is seen). Read-only.
+      - type: bind
+        source: ${BRIDGEKEEP_PORTAL_CONFIG:-/var/lib/bridgekeep/portal-config}
+        target: /config/portal
+        read_only: true
+        bind:
+          create_host_path: true
+      - imap-proxy-state:/proxy-state   # the daily move count and the undo ledger
+    networks:
+      mail: {}                  # to Bridge
+      analyzer-imap:
+        aliases: [imap-proxy]
+    healthcheck:
+      test: ["CMD", "python", "-P", "-c", "import socket; s = socket.create_connection(('127.0.0.1', 1143), 5); assert s.recv(100).startswith(b'* OK'); s.sendall(b'h LOGOUT\\r\\n'); s.recv(100)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 20s
+
+  egress-proxy:
+    <<: *analyzer-hardening
+    command: ["egress-proxy"]
+    mem_limit: 64m
+    networks:
+      analyzer-api:
+        aliases: [egress-proxy]
+      api-egress: {}            # the only network with a route out
+    healthcheck:
+      test: ["CMD", "python", "-P", "-c", "import socket; socket.create_connection(('127.0.0.1', 3128), 5)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 20s
+
+  analyzer:
+    <<: *analyzer-hardening
+    command: ["run"]
+    mem_limit: 256m             # the parser's memory cap (review A5)
+    depends_on: [imap-proxy, egress-proxy]
+    # One key file per AI vendor; only the chosen vendor's is ever read
+    # (model.provider), and the egress proxy reaches only that vendor.
+    secrets: [anthropic_api_key, openai_api_key, gemini_api_key, local_api_key, analyzer_imap_token]
+    volumes:
+      - ./config:/config:ro     # analyzer.yaml, lists/, and the PAUSE kill switch
+      - type: bind                       # the portal's portal.yaml and PAUSE, read-only here
+        source: ${BRIDGEKEEP_PORTAL_CONFIG:-/var/lib/bridgekeep/portal-config}
+        target: /config/portal
+        read_only: true
+        bind:
+          create_host_path: true
+      - analyzer-data:/data     # decision log (no message bodies)
+      - ${BRIDGEKEEP_NOTIFY_DIR:-/var/lib/bridgekeep/notify}/spool/analyzer:/run/bridgekeep/alerts   # alerts out (docs/alerts.md)
+    networks:
+      analyzer-imap: {}         # internal: imap-proxy only
+      analyzer-api: {}          # internal: egress-proxy only
+    healthcheck:
+      test: ["CMD", "python", "-P", "-m", "analyzer", "health"]
+      interval: 60s
+      timeout: 10s
+      start_period: 180s
+
+  # One-click unsubscribe (analyzer/src/analyzer/unsubscribe.py). Acts only
+  # when the portal asks, by decision id; reads the link from the decision log
+  # itself (read-only). Its own user, its own way out, no secrets, never on
+  # the mail network.
+  unsubscribe:
+    <<: *analyzer-hardening
+    command: ["unsubscribe-service", "--db", "/data/analyzer.db", "--state", "/state/unsubscribe.json"]
+    user: "10004:10002"
+    mem_limit: 64m
+    volumes:
+      - analyzer-data:/data:ro
+      - unsubscribe-data:/state  # attempts per message and today's count, nothing else
+    networks:
+      portal-unsub:
+        aliases: [unsubscribe]
+      unsub-egress: {}          # https to senders' unsubscribe hosts (public addresses only, checked in code)
+    healthcheck:
+      test: ["CMD", "python", "-P", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8025/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 20s
+
+  # -- Admin portal (profile "portal") ---------------------------------------
+
+  portal:
+    image: ${PORTAL_IMAGE:-bridgekeep-portal:local}
+    build: portal
+    profiles: [portal]
+    restart: unless-stopped
+    # Bridge first, so it seeds the new broker-sock volume with its own
+    # /run/broker (2750 bridge:10010), not a root-owned empty folder.
+    depends_on: [bridge]
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 192m             # argon2id uses 64 MiB per sign-in
+    pids_limit: 64
+    environment:
+      PORTAL_PORT: ${PORTAL_PORT:-8443}
+      PORTAL_HOSTS: ${PORTAL_HOSTS:-}   # extra Host names to accept, e.g. nas.local,192.168.1.20
+      # The one switch for network mode: the address published below. Anything
+      # but loopback also turns on HTTPS in the portal, so they can't disagree.
+      PORTAL_ADDRESS: ${PORTAL_ADDRESS:-127.0.0.1}
+      TZ: ${TZ:-}
+    # Security review P5: this computer only by default. `./bridgekeep portal
+    # network on` sets PORTAL_ADDRESS to one interface address, never 0.0.0.0.
+    ports:
+      - "${PORTAL_ADDRESS:-127.0.0.1}:${PORTAL_PORT:-8443}:8443"
+    group_add: ["10010"]        # may talk to the sign-in broker's socket (0660)
+    volumes:
+      - portal-data:/data                 # admin, sessions, audit log
+      - broker-sock:/run/broker:ro        # Proton sign-in through Bridge's broker; no password comes back
+      - analyzer-data:/analyzer:ro        # health.json and the decision log, read-only
+      # What the host reports every 5 minutes (Bridge, sign-in, updates, storage,
+      # Docker version), written by health-watch. Read-only; holds no secrets.
+      - type: bind
+        source: ${BRIDGEKEEP_STATUS_DIR:-/var/lib/bridgekeep/status}
+        target: /host-status
+        read_only: true
+        bind:
+          create_host_path: true
+      # The portal's own settings: portal.yaml (protected senders) and PAUSE.
+      # Outside the checkout (the nightly root job needs the checkout root-only);
+      # 10003:10002 2750, made by ./bridgekeep setup. The analyzer reads it at /config/portal.
+      - type: bind
+        source: ${BRIDGEKEEP_PORTAL_CONFIG:-/var/lib/bridgekeep/portal-config}
+        target: /portal-config
+        bind:
+          create_host_path: true
+      - ./config/lists:/config-lists:ro   # your curated.yaml, shown read-only
+      # Write-only drop box for the Claude API key and Discord webhook: the
+      # portal leaves a request, root's scripts/secret-requests.sh (from the
+      # watch timer) checks and installs it. The portal never reads a secret.
+      - type: bind
+        source: ${BRIDGEKEEP_SECRET_REQUESTS:-/var/lib/bridgekeep/secret-requests}
+        target: /secret-requests
+        bind:
+          create_host_path: true
+    networks:
+      portal-web: {}
+      portal-unsub: {}          # asks the analyzer's unsubscribe service, by decision id only
+
+volumes:
+  # Holds the Bridge vault, GPG key and pass store: it IS the mailbox key.
+  # Back it up encrypted only (docs/operations.md).
+  bridge-data:
+  analyzer-data:
+  portal-data:
+  unsubscribe-data:
+  imap-proxy-state:
+  # The sign-in broker's socket (bridge and portal) and the Bridge password it
+  # saves (bridge and imap-proxy). The portal never mounts bridge-credential.
+  broker-sock:
+  bridge-credential:
+
+# Kept OUTSIDE the checkout (default /etc/bridgekeep/secrets; set
+# BRIDGEKEEP_SECRETS in .env to move it). `make analyzer-init` creates them,
+# owned by the containers' user (10002) and mode 0400, in a root-only folder.
+secrets:
+  bridge_password:
+    file: ${BRIDGEKEEP_SECRETS:-/etc/bridgekeep/secrets}/bridge_password        # from `info` in bridge-init; only imap-proxy gets it
+  analyzer_imap_token:
+    file: ${BRIDGEKEEP_SECRETS:-/etc/bridgekeep/secrets}/analyzer_imap_token    # random; `make analyzer-init` creates it
+  anthropic_api_key:
+    file: ${BRIDGEKEEP_SECRETS:-/etc/bridgekeep/secrets}/anthropic_api_key      # a dedicated key with a spend limit (review A14)
+  openai_api_key:
+    file: ${BRIDGEKEEP_SECRETS:-/etc/bridgekeep/secrets}/openai_api_key         # empty unless OpenAI is chosen
+  gemini_api_key:
+    file: ${BRIDGEKEEP_SECRETS:-/etc/bridgekeep/secrets}/gemini_api_key         # empty unless Gemini is chosen
+  local_api_key:
+    file: ${BRIDGEKEEP_SECRETS:-/etc/bridgekeep/secrets}/local_api_key          # optional, for a local server that wants one
+
+networks:
+  egress: {}
+  # Internal: no route to the outside world, not reachable from the host.
+  # Mail clients (e.g. the future analyzer) join this network.
+  mail:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${BRIDGE_MAIL_SUBNET:-172.31.253.0/24}
+  # Internal links between the analyzer and its two proxies. The analyzer
+  # joins only these two, so it has no route to Bridge or the internet.
+  analyzer-imap:
+    internal: true
+  analyzer-api:
+    internal: true
+  # egress-proxy's way out, separate from Bridge's.
+  api-egress: {}
+  # Portal -> unsubscribe service only.
+  portal-unsub:
+    internal: true
+  # The unsubscribe service's way out, separate from Bridge's and the API's.
+  unsub-egress: {}
+  # The portal's own network. Not `internal` (Docker publishes no ports for
+  # those), but with no masquerade, so the portal has no route to the
+  # internet, and no traffic between containers on it.
+  portal-web:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.enable_icc: "false"

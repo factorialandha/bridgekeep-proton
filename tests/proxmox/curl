@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Stand-in for curl, for install.sh in tests/proxmox.sh: no network. Saves its
+# arguments ($PX/curl-args) and its -K - config from stdin ($PX/curl-cfg), then
+# "downloads" $MOCK_TARBALL, or fails like a 404 when MOCK_CURL_404 is set.
+set -euo pipefail
+printf '%s\n' "$@" >"$PX/curl-args"
+out='' cfg=false
+while (($#)); do
+  case $1 in
+    -o) out=$2; shift ;;
+    -K) [[ $2 == - ]] && cfg=true; shift ;;
+  esac
+  shift
+done
+if $cfg; then cat >"$PX/curl-cfg"; fi
+if [[ -n ${MOCK_CURL_404:-} ]]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi
+cp "$MOCK_TARBALL" "$out"

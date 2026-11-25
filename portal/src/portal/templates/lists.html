@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Lists{% endblock %}
+{% block main %}
+<h1>Lists</h1>
+<p class="lead">Rules the analyzer always follows, before it asks the AI.</p>
+{% if done == "added" %}<p class="ok" role="status">✓ Added. The analyzer picks it up within a minute.</p>{% elif done == "removed" %}<p class="ok" role="status">✓ Removed.</p>{% elif done == "restored" %}<p class="ok" role="status">✓ Restored. The analyzer uses it again within a minute.</p>{% endif %}
+{% if error and not form.get("list") %}{% include "_error.html" %}{% endif %}
+{% if not writable %}<p class="nudge" role="alert">The portal can't save changes yet: its settings folder isn't set up. Run <code>./bridgekeep setup</code> on the host.</p>{% endif %}
+{% if problems %}
+<div class="nudge" role="alert">
+  <p><strong>The analyzer is ignoring {{ problems | length }} {{ "entry" if problems | length == 1 else "entries" }}:</strong></p>
+  <ul class="plain">
+  {% for p in problems %}
+    <li>{{ p.text.rstrip(".") }}.
+      {% if p.fix == "address" %} <a href="/lists?add=protect:address&amp;hint={{ p.value | urlencode }}#add">Protect an exact address instead</a>{% endif %}
+      {% if p.index >= 0 %}
+      <form method="post" action="/lists/remove" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="hidden" name="list" value="{{ p.list }}"><input type="hidden" name="index" value="{{ p.index }}"><input type="hidden" name="value" value="{{ p.value }}">
+        <button class="ghost" aria-label="Remove {{ p.value }} from {{ labels[p.list] }}" {{ "disabled" if not writable }}>Remove</button>
+      </form>
+      {% elif p.list %}
+      <form method="post" action="/lists/remove" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="source" value="file">
+        <input type="hidden" name="list" value="{{ p.list }}"><input type="hidden" name="value" value="{{ p.value }}">
+        <button class="ghost" aria-label="Remove {{ p.value }} from {{ labels[p.list] }}" {{ "disabled" if not writable }}>Remove</button>
+      </form>{% endif %}
+    </li>
+  {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+{% set err_list = form.get("list", "") if error else "" %}
+{% for list_name, label in labels.items() %}
+{% set items = rows | selectattr("list", "equalto", list_name) | list %}
+{% set mine = form.get("list") == list_name %}
+<section class="lpanel" id="list-{{ list_name }}" aria-labelledby="h-{{ list_name }}">
+  <div class="lhead">
+    <h2 id="h-{{ list_name }}">{{ label }} <span class="sub">{{ items | length }}</span></h2>
+    <p class="sub">{{ help[list_name] }}</p>
+  </div>
+  <form method="post" action="/lists/add" class="ladd"{% if mine %} id="add"{% endif %}>
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="list" value="{{ list_name }}"><input type="hidden" name="kind" value="auto">
+    {% if err_list == list_name %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <div class="lrow">
+      <label for="v-{{ list_name }}" class="vh">{{ fields[list_name][0] }} for {{ label }}</label>
+      <input id="v-{{ list_name }}" name="value" maxlength="254" autocomplete="off" required
+             placeholder="{{ ('someone@' ~ hint) if (hint and list_name == 'protect') else fields[list_name][1] }}"
+             value="{{ form.get('value', '') if mine else '' }}"{% if mine and (form.get('value') or err_list) %} autofocus{% endif %}>
+      <button class="primary" {{ "disabled" if not writable }}>Add</button>
+    </div>
+    <details class="more"{% if mine and (form.get("reason") or form.get("expires") or form.get("subdomains")) %} open{% endif %}>
+      <summary>More options</summary>
+      <label for="r-{{ list_name }}">Why <span class="sub">(optional)</span></label>
+      <input id="r-{{ list_name }}" name="reason" maxlength="200" value="{{ form.get('reason', '') if mine else '' }}" placeholder="e.g. Order and delivery updates">
+      <label for="e-{{ list_name }}">Until <span class="sub">(optional)</span></label>
+      <input id="e-{{ list_name }}" name="expires" type="date" value="{{ form.get('expires', '') if mine else '' }}">
+      {% if list_name == "protect" %}<label class="check"><input type="checkbox" name="subdomains" {{ "checked" if mine and form.get("subdomains") == "on" }}> Include subdomains (domains only)</label>
+      <p class="hint">Free-mail domains such as gmail.com can only be added as exact addresses.</p>{% endif %}
+    </details>
+  </form>
+  {% if items %}
+  <ul class="entries">
+  {% for r in items %}
+    <li>
+      <div class="ev">
+        <span class="val">{% if r.kind == "address" %}{{ r.value | sender }}{% elif r.kind == "domain" %}{{ "*." if r.subdomains }}{{ r.value }}{% else %}“{{ r.value }}”{% endif %}</span>
+        <span class="badge muted">{{ {"address": "Address", "domain": "Whole domain"}.get(r.kind, "Words") }}</span>
+        {% if r.source != "portal" %}<span class="badge muted">Came with setup</span>{% endif %}
+        {% if r.reason or r.expires or r.added %}<span class="sub why">{{ r.reason }}{% if r.expires %} · until {{ r.expires }}{% endif %}{% if r.added %} · added {{ r.added }}{% endif %}</span>{% endif %}
+      </div>
+      <form method="post" action="/lists/remove" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="back" value="/lists">
+        <input type="hidden" name="list" value="{{ r.list }}"><input type="hidden" name="index" value="{{ r.index }}"><input type="hidden" name="value" value="{{ r.value }}">
+        {% if r.source != "portal" %}<input type="hidden" name="source" value="file">{% endif %}
+        <button class="ghost" aria-label="Remove {{ r.value }} from {{ labels[r.list] }}" {{ "disabled" if not writable }}>Remove</button>
+      </form>
+    </li>
+  {% endfor %}
+  </ul>
+  {% else %}
+  <p class="sub empty">Nothing here yet.</p>
+  {% endif %}
+</section>
+{% endfor %}
+<p class="hint">Adding or removing asks for your password if you haven't confirmed it in the last 5 minutes. The analyzer picks changes up within a minute.</p>
+
+{% if removed %}
+<h2 class="section">Removed ({{ removed | length }})</h2>
+<p class="sub">These came with your setup. You removed them, so the analyzer ignores them.</p>
+<ul class="plain">
+  {% for list_name, value in removed %}
+  <li>{{ value }} <span class="sub">({{ labels[list_name] }})</span>
+    <form method="post" action="/lists/restore" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="back" value="/lists">
+      <input type="hidden" name="list" value="{{ list_name }}"><input type="hidden" name="value" value="{{ value }}">
+      <button class="ghost" aria-label="Restore {{ value }} to {{ labels[list_name] }}" {{ "disabled" if not writable }}>Restore</button>
+    </form>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

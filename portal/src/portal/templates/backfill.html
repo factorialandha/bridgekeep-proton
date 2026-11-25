@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}Older mail{% endblock %}
+{% block head %}{% if pending or (job and job.status in ("estimating", "running")) %}<meta http-equiv="refresh" content="30">{% endif %}{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/analyzer">Analyzer</a> / Older mail</p>
+<h1>Older mail</h1>
+<p class="lead">The analyzer only looks at mail that arrives after setup. To have it look at mail from before, get a cost estimate first, then start it. Like everything else it's log-only: it writes what it would do, and moves nothing.</p>
+{% if done == "estimate" %}<p class="ok" role="status">✓ Asked for an estimate. The analyzer reads only the headers, and the numbers show here within a few minutes.</p>{% endif %}
+{% if done == "started" %}<p class="ok" role="status">✓ Started. Progress shows here.</p>{% endif %}
+{% if done in ("paused", "resumed", "cancelled") %}<p class="ok" role="status">✓ Sent. The analyzer acts on it at its next check.</p>{% endif %}
+{% include "_error.html" %}
+{% if not writable %}<p class="nudge" role="alert">The portal can't save requests yet: its settings folder isn't set up. Run <code>./bridgekeep setup</code> on the host.</p>{% endif %}
+{% if pending %}<p class="nudge" role="status"><span class="badge review">! Waiting for the analyzer</span> It picks up your last request at its next check. Reload this page in a minute.</p>{% endif %}
+
+{% set j = job %}
+{% if j and j.status == "estimating" %}
+<h2 class="section">Estimating</h2>
+<p>Reading headers: {{ "{:,}".format(j.scanned) }}{% if j.candidates %} of {{ "{:,}".format(j.candidates) }}{% endif %}. Nothing is sent anywhere while it estimates. Reload this page to see progress.</p>
+<form method="post" action="/backfill/cancel" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost" {{ "disabled" if pending }}>Cancel</button></form>
+
+{% elif j and j.status == "estimated" and stale %}
+<p class="nudge" role="alert">The last estimate is more than a day old, so it can't be started. Estimate again below.</p>
+
+{% elif j and j.status == "estimated" %}
+<h2 class="section">Estimate ready</h2>
+<p class="nudge" role="note">{{ disclosure }}</p>
+<div class="table-wrap"><table class="data">
+  <tr><th scope="row">Dates</th><td>{{ j.since or "The oldest message" }} to {{ j.until or "setup" }}{% if j.limit %}, at most {{ "{:,}".format(j.limit) }} messages{% endif %}</td></tr>
+  <tr><th scope="row">Estimated cost</th><td>About ${{ "%.2f"|format(j.est_usd) }} with {{ vendor }}</td></tr>
+  <tr><th scope="row">Budget left this month</th><td>${{ "%.2f"|format(j.budget_left_usd) }} of ${{ "%.0f"|format(j.budget_usd) }} (10% is kept for new mail)</td></tr>
+  <tr><th scope="row">How long</th><td>{% if j.est_hours < 1 %}Under an hour{% else %}About {{ j.est_hours }} hour{{ "s" if j.est_hours != 1 }}{% endif %}. New mail always goes first.</td></tr>
+</table></div>
+{% if j.reason %}<p class="nudge" role="alert">The analyzer didn't start it: {{ j.reason }}.</p>{% endif %}
+<form method="post" action="/backfill/start" class="narrow">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="back" value="/backfill">
+  <input type="hidden" name="estimate_id" value="{{ j.id }}"><input type="hidden" name="provider" value="{{ provider }}">
+  {% if not j.fits_budget %}
+  <p>That's more than the budget left this month. About {{ "{:,}".format(j.calls_that_fit) }} of the {{ "{:,}".format(j.est_calls) }} messages fit. It stops there and carries on next month, or you can narrow the dates below.</p>
+  <label class="check"><input type="checkbox" name="allow_partial" value="yes" required> Start anyway, and stop when this month's budget is used</label>
+  {% endif %}
+  <p class="hint">Starting asks for your password if you haven't confirmed it in the last 5 minutes. You can pause or cancel at any time.</p>
+  <button class="primary" {{ "disabled" if pending or not writable }}>Start</button>
+</form>
+
+{% elif j and j.status in ("running", "paused") %}
+<h2 class="section">{{ "Running" if j.status == "running" else "Paused" }}</h2>
+<p>{{ "{:,}".format(j.processed) }} of {{ "{:,}".format(j.selected) }} messages · {{ "{:,}".format(j.model_calls) }} sent to {{ vendor }} · ${{ "%.2f"|format(j.spend_usd) }} so far</p>
+{% if j.reason %}<p class="sub">{{ j.reason[:1]|upper }}{{ j.reason[1:] }}.</p>{% endif %}
+{% if j.status == "running" %}
+<form method="post" action="/backfill/pause" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="primary" {{ "disabled" if pending }}>Pause</button></form>
+{% else %}
+<form method="post" action="/backfill/resume" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="back" value="/backfill"><button class="primary" {{ "disabled" if pending }}>Resume</button></form>
+{% endif %}
+<form method="post" action="/backfill/cancel" class="inline spaced"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost" {{ "disabled" if pending }}>Cancel for good</button></form>
+<p><a href="/log">See what it decided in the log</a></p>
+
+{% elif j and j.status == "done" %}
+<p class="ok" role="status">✓ The last backfill finished: {{ "{:,}".format(j.processed) }} messages, ${{ "%.2f"|format(j.spend_usd) }}{% if j.finished %}, {{ j.finished | ago }}{% endif %}. <a href="/log">See it in the log</a>.</p>
+{% elif j and j.status == "cancelled" %}
+<p class="sub">The last backfill was cancelled{% if j.reason and j.reason != "cancelled on request" %}: {{ j.reason }}{% endif %}.</p>
+{% endif %}
+
+{% if not j or j.status in ("estimated", "done", "cancelled") %}
+<h2 class="section">{{ "Estimate again" if j and j.status == "estimated" else "Get an estimate" }}</h2>
+{% if model_state == "off" %}<p class="sub">The AI model is off, so the backfill would only use your lists and rules. Turn it on under <a href="/analyzer">Analyzer</a> first.</p>
+{% elif model_state == "no_key" %}<p class="sub">There's no API key for {{ vendor }}, so the backfill would only use your lists and rules. <a href="{{ '/analyzer#api-key' if provider == 'anthropic' else '/analyzer/vendor' }}">Add a key</a> first.</p>
+{% elif model_state == "no_price" %}<p class="sub">The model has no prices yet, so the backfill would only use your lists and rules. <a href="/analyzer/vendor">Add prices</a> first.</p>{% endif %}
+<form method="post" action="/backfill/estimate" class="narrow">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <label for="since">From (optional)</label>
+  <input id="since" name="since" type="date" value="{{ form.get('since', '') }}">
+  <label for="until">To (optional)</label>
+  <input id="until" name="until" type="date" value="{{ form.get('until', '') }}">
+  <p class="hint">Empty means from the oldest message, and up to setup.</p>
+  <label for="limit">At most this many messages (optional)</label>
+  <input id="limit" name="limit" inputmode="numeric" maxlength="7" value="{{ form.get('limit', '') }}">
+  <p class="hint">Newest first. The estimate reads only headers and sends nothing anywhere.</p>
+  <button class="primary" {{ "disabled" if pending or not writable }}>Estimate the cost</button>
+</form>
+{% endif %}
+{% endblock %}

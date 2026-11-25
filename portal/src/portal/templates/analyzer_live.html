@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Switch to live mode?{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/analyzer">Analyzer</a> / Live mode</p>
+<h1>Switch to live mode?</h1>
+<p class="nudge" role="note">Only new mail moves, into AI-Review and AI-Quarantine in Proton. Nothing is deleted. Not spam moves it back.</p>
+<ul>
+  <li>Nothing goes to Proton's Trash and nothing is deleted. In Bridgekeep, "Trash" means the AI-Quarantine folder. Nothing is marked read, and older mail (including a backfill) never moves.</li>
+  <li>Senders on Never trash are never moved.</li>
+  {% if live.move_cap is not none %}<li>At most {{ "{:,}".format(live.move_cap) }} moves a day. If it reaches that, moves stop and you get a Discord alert.</li>{% endif %}
+  <li>You get a Discord alert whenever the mode changes.</li>
+</ul>
+<h2 class="section">How shadow mode went</h2>
+<dl>
+  {% if live.shadow_since %}<dt>In shadow since</dt><dd>{{ live.shadow_since | when }}</dd>{% endif %}
+  <dt>Would have moved</dt><dd>{% if live.would_review is not none or live.would_quarantine is not none %}{{ "{:,}".format(live.would_review or 0) }} to AI-Review, {{ "{:,}".format(live.would_quarantine or 0) }} to AI-Quarantine{% else %}Not reported yet{% endif %}</dd>
+  {% set a = live.agreement or {} %}
+  <dt>Your answers</dt><dd>{% if a.corrections %}Of {{ "{:,}".format(a.corrections) }} answers, the analyzer agreed with {{ "{:,}".format(a.model_agreed or 0) }}. It called {{ "{:,}".format(a.said_spam_was_fine or 0) }} good messages spam and missed {{ "{:,}".format(a.missed_spam or 0) }} spam.{% else %}None yet. Answering "Was this right?" on a few Log entries shows how well it would do.{% endif %}</dd>
+</dl>
+{% if paused %}<p class="nudge" role="alert">The analyzer is paused. Live mode starts when you resume it.</p>{% endif %}
+<p>You can switch back to shadow mode at any time with one click, and the Log shows every move.</p>
+<form method="post" action="/analyzer/live" class="inline">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="confirm" value="yes"><input type="hidden" name="back" value="/analyzer">
+  <button class="primary">Switch to live</button>
+</form>
+<a href="/analyzer" class="spaced">Cancel</a>
+{% endblock %}

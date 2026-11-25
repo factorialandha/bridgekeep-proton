@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proton-mail-analyzer"
+version = "0.1.0"
+description = "Classifies new Proton mail with Claude and logs what it would do (shadow mode)"
+requires-python = ">=3.12"
+# Exact pins live in requirements.txt (with hashes) for the image.
+dependencies = ["anthropic>=2.6,<3", "PyYAML>=6,<7"]
+
+[project.scripts]
+analyzer = "analyzer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

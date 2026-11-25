@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+echo "pvesm $*" >>"$PX/log"
+case "$1 $3" in
+  "status rootdir") printf 'Name Type Status Total Used Available %%\nlocal dir active 1 1 1 1%%\nlocal-lvm lvmthin active 1 1 1 1%%\n' ;;
+  "status vztmpl")  printf 'Name Type Status Total Used Available %%\nlocal dir active 1 1 1 1%%\n' ;;
+  "path "*) echo "$PX/tmpl/${2#*:vztmpl/}" ;;
+esac

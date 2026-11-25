@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% from "_macros.html" import subject, verdict_badge %}
+{% block title %}Review{% endblock %}
+{% block main %}
+<h1>Review{% if waiting %} <span class="pill">{{ waiting | length }} waiting</span>{% endif %}</h1>
+<p class="lead">Mail the analyzer wasn't sure about in the last 14 days. Shadow mode moves nothing. Your answer teaches the analyzer about the sender.</p>
+{% if done %}<p class="ok" role="status">✓ Saved: {{ "Not spam" if done == "keep" else "Spam" }}. It's listed under Answered recently, where you can undo it.</p>{% endif %}
+{% if not waiting %}
+<p class="empty">Nothing waiting. ✓</p>
+{% else %}
+<ul class="queue">
+  {% for r in waiting %}
+  <li class="qcard">
+    <div class="qtop"><span class="from sender">{{ r.from_addr | sender }}{% if r.ts %} · {{ r.ts | short_when }}{% endif %}</span>
+      {% if r.confidence is not none %}<span class="pct">{{ "%.0f" | format(r.confidence * 100) }}% {{ "not spam" if r.label in ("ham", "legitimate") else "spam" }}</span>{% endif %}</div>
+    <a class="subj" href="/log/entry?id={{ r.id }}">{{ subject(r) }}</a>{% if r.injections %} <span class="badge trash">✗ Possible injection</span>{% endif %}
+    <p class="why">{% if r.reason %}The AI says: “{{ r.reason }}”{% else %}{{ r.explain }}{% endif %}</p>
+    <div class="acts">
+      <form method="post" action="/review/verdict" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ r.id }}">
+        <button name="verdict" value="keep">Not spam</button>
+        <button name="verdict" value="trash">Spam</button>
+      </form>
+      {% if r.from_addr %}<a class="quiet" href="/lists?add=protect:address&amp;value={{ r.from_addr | urlencode }}#add">Never trash this sender</a>{% endif %}
+    </div>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% if answered %}
+<h2 class="spaced">Answered recently</h2>
+<div class="table-wrap">
+<table class="data cards">
+  <tbody>
+  {% for r in answered %}
+  <tr>
+    <td class="sender">{{ r.from_addr | sender }}</td>
+    <td><a href="/log/entry?id={{ r.id }}">{{ subject(r) }}</a></td>
+    <td>{{ verdict_badge(verdicts[r.key]) }}</td>
+    <td><form method="post" action="/review/verdict" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ r.id }}"><button name="verdict" value="undo" class="ghost">Undo</button></form></td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

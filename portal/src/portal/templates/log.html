@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% from "_macros.html" import action, subject, verdict_badge %}
+{% block title %}Log{% endblock %}
+{% block main %}
+<h1>Log</h1>
+<div class="scorecard" role="group" aria-label="Last 14 days">
+  <div><span class="num big">{{ card.seen }}</span><span class="sub">messages checked</span></div>
+  <div><span class="num big">{{ card.quarantine }}</span><span class="sub">would be trashed</span></div>
+  <div><span class="num big">{{ card.review }}</span><span class="sub">sent to review</span></div>
+  <div><span class="num big">{{ card.protected }}</span><span class="sub">protected saves</span></div>
+  <div><span class="num big">{{ card.answered }}</span><span class="sub">answered by you</span></div>
+</div>
+<form method="get" action="/log" class="filters" role="search">
+  <label for="q" class="vh">Search sender, domain or subject</label>
+  <input id="q" name="q" value="{{ query.q }}" placeholder="Search sender, domain or subject" type="search">
+  <label for="action" class="vh">Action</label>
+  <select id="action" name="action">
+    <option value="" {% if not query.action %}selected{% endif %}>Any action</option>
+    <option value="quarantine" {% if query.action == "quarantine" %}selected{% endif %}>Trash</option>
+    <option value="review" {% if query.action == "review" %}selected{% endif %}>Review</option>
+    <option value="keep" {% if query.action == "keep" %}selected{% endif %}>Kept</option>
+  </select>
+  <label for="days" class="vh">Period</label>
+  <select id="days" name="days">
+    {% for d in days_options %}<option value="{{ d }}" {% if query.days == d %}selected{% endif %}>Last {{ d }} day{{ "s" if d != 1 }}</option>{% endfor %}
+  </select>
+  {% if query.flag %}<input type="hidden" name="flag" value="{{ query.flag }}">{% endif %}
+  <button>Search</button>
+</form>
+<p class="chips">
+  {% for name, f in filters.items() %}
+  <a class="chip" href="{{ query.url(flag='' if query.flag == name else name, before=0) }}" {% if query.flag == name %}aria-current="true"{% endif %}>{{ f[0] }}</a>
+  {% endfor %}
+  {% if query.q or query.action or query.flag or query.days != 14 %}<a href="/log">Clear</a>{% endif %}
+</p>
+<div class="table-wrap">
+<table class="data log">
+  <thead><tr><th scope="col">Subject</th><th scope="col">Sender</th><th scope="col">Result</th><th scope="col">Why</th><th scope="col">Time</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+  <tr>
+    <td class="subj"><a href="/log/entry?id={{ r.id }}">{{ subject(r) }}</a> {{ verdict_badge(verdicts.get(r.key, "")) }}</td>
+    <td class="sender">{{ r.from_addr | sender }}</td>
+    <td class="res">{{ action(r) }}</td>
+    <td class="why">{{ r | why }}</td>
+    <td class="num t"><time datetime="{{ r.ts | iso }}" title="{{ r.ts | when }}">{{ r.ts | short_when }}</time></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="sub">Nothing matches.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if older %}<p><a href="{{ older }}">Older entries</a></p>{% endif %}
+{% endblock %}

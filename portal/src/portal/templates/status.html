@@ -1,0 +1,198 @@
+{% extends "base.html" %}
+{% block title %}Status{% endblock %}
+{% block main %}
+<h1>Status</h1>
+{% if not totp_on and not lan %}<p class="nudge" role="note">Your portal sign-in uses only a password. <a href="/settings#authenticator">Add an authenticator app</a> so a leaked password isn't enough.</p>{% endif %}
+{% set b = host.bridge if host.bridge is defined else none %}
+{% set st = host.storage if host.storage is defined else none %}
+{# The answer first: what's broken, then what needs you, then the details. #}
+{% set n = namespace(bad=[], todo=[]) %}
+{% if not b %}{% set n.bad = n.bad + [("Bridge hasn't reported yet", "")] %}
+{% else %}
+  {% if b.health not in ("healthy", "starting", "paused") %}{% set n.bad = n.bad + [("Bridge is " ~ b.health, "Run ./bridgekeep doctor on the host.")] %}{% endif %}
+  {% if b.health == "paused" %}{% set n.todo = n.todo + [("Bridge is stopped on purpose", "Run ./bridgekeep start on the host to start it.")] %}{% endif %}
+  {% if not b.signed_in %}{% set n.bad = n.bad + [("Bridge isn't signed in to Proton", "Run ./bridgekeep relogin on the host.")] %}{% endif %}
+  {% if b.update_waiting %}{% set n.todo = n.todo + [("Bridge " ~ b.update_waiting ~ " is ready to install", "Run ./bridgekeep deploy-update on the host. It keeps a rollback.")] %}{% endif %}
+{% endif %}
+{% if health.state in ("stalled", "bridge_unreachable", "unknown") %}{% set n.bad = n.bad + [("The analyzer isn't checking mail", "Run ./bridgekeep doctor on the host.")] %}{% endif %}
+{% if health.model == "no_key" %}{% set n.todo = n.todo + [("The AI has no API key, so only your lists and rules decide", "/analyzer#api-key")] %}{% endif %}
+{% if health.model == "budget_cap" %}{% set n.todo = n.todo + [("This month's AI budget is used up", "/analyzer")] %}{% endif %}
+{% if st and st.low %}{% set n.bad = n.bad + [("The disk is nearly full", "Free some space, or Bridge stops syncing.")] %}{% endif %}
+{% if versions.update_ready %}{% set n.todo = n.todo + [("A Bridgekeep update is ready", "Run ./bridgekeep setup on the host.")] %}{% endif %}
+{% if host.docker is defined and host.docker.old %}{% set n.todo = n.todo + [("Docker is older than 28", "Update Docker Engine on the host.")] %}{% endif %}
+
+<div class="summary {{ 'bad' if n.bad else 'good' }}" role="status">
+  <p class="headline">{% if n.bad %}✗ {{ n.bad[0][0] }}{% if n.bad | length > 1 %} <span class="sub">and {{ n.bad | length - 1 }} more</span>{% endif %}{% else %}✓ Everything is working{% endif %}</p>
+  {% if n.bad or n.todo or review_waiting or paused %}
+  <ul class="needs">
+    {% for what, how in n.bad %}<li class="bad">{{ what }}{% if how %}. <span class="sub">{{ how }}</span>{% endif %}</li>{% endfor %}
+    {% if review_waiting %}<li><a href="/review">{{ review_waiting }} message{{ "s" if review_waiting != 1 }} waiting in Review</a></li>{% endif %}
+    {% if paused %}<li>The analyzer is paused <form method="post" action="/analyzer/resume" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Resume</button></form></li>{% endif %}
+    {% for what, how in n.todo %}<li>{% if how.startswith("/") %}<a href="{{ how }}">{{ what }}</a>{% else %}{{ what }}{% if how %}. <span class="sub">{{ how }}</span>{% endif %}{% endif %}</li>{% endfor %}
+  </ul>
+  {% endif %}
+</div>
+
+<div class="scorecard" role="group" aria-label="At a glance">
+  <div><span class="sub">Bridge</span><span class="big">{% if b and b.health == "healthy" %}Running{% elif b %}{{ b.health | capitalize }}{% else %}—{% endif %}</span></div>
+  <div><span class="sub">Mail synced</span><span class="big num">{% if b and b.messages is not none %}{{ "{:,}".format(b.messages) }}{% else %}—{% endif %}</span></div>
+  <div><span class="sub">AI this month</span><span class="big num">{% if health.spend is not none %}${{ "%.2f"|format(health.spend) }}{% if health.budget %} <span class="sub">of ${{ "%.0f"|format(health.budget) }}</span>{% endif %}{% else %}—{% endif %}</span></div>
+  <div><span class="sub">Disk free</span><span class="big num">{% if st %}{{ st.free }}{% else %}—{% endif %}</span></div>
+</div>
+
+<details class="status-details">
+<summary>Details: Bridge, analyzer, storage, this portal</summary>
+<h2 class="section">Bridge</h2>
+<table class="rows">
+  <tbody>
+  {% if b %}
+  <tr>
+    <th scope="row">Bridge</th>
+    <td>
+      {% if b.health == "healthy" %}<span class="badge safe">✓ Running</span>
+      {% elif b.health == "starting" %}<span class="badge review">! Starting</span>
+      {% elif b.health == "paused" %}<span class="badge review">Paused</span> <span class="sub">Stopped on purpose. Run <code>./bridgekeep start</code> on the host to start it again.</span>
+      {% else %}<span class="badge trash">✗ {{ b.health | capitalize }}</span> <span class="sub">Run <code>./bridgekeep doctor</code> on the host.</span>{% endif %}
+      {% if b.paused %}<span class="sub">Stopped on purpose: {{ b.paused | join(", ") }}. <code>./bridgekeep start</code> starts them again.</span>{% endif %}
+      <span class="sub">Checked {{ b.ts | ago }}{% if b.stale %}: the host hasn't reported for a while{% endif %}</span>
+    </td>
+  </tr>
+  <tr>
+    <th scope="row">Proton sign-in</th>
+    <td>
+      {% if b.signed_in %}<span class="badge safe">✓ Signed in</span> {{ b.account }}
+      {% else %}<span class="badge trash">✗ Not signed in</span> <span class="sub">{{ b.error or "No saved sign-in." }} Run <code>./bridgekeep relogin</code> on the host.</span>{% endif %}
+    </td>
+  </tr>
+  <tr>
+    <th scope="row">Mail sync</th>
+    <td>{% if b.messages is not none %}{{ "{:,}".format(b.messages) }} messages{% if b.messages_prev is not none and b.messages > b.messages_prev %} <span class="sub">still syncing: {{ "{:,}".format(b.messages - b.messages_prev) }} more since the check before</span>{% endif %}{% else %}<span class="sub">Not counted yet</span>{% endif %}</td>
+  </tr>
+  <tr>
+    <th scope="row">Updates</th>
+    <td>
+      {% if b.update_waiting %}<span class="badge review">! Update ready</span> Bridge {{ b.update_waiting }}
+      {% elif b.update_scheduled %}<span class="badge safe">✓ Checked {{ b.update_when }}</span>
+      {% else %}<span class="badge review">! Not scheduled</span> <span class="sub">Run <code>./bridgekeep setup</code> to schedule nightly checks.</span>{% endif %}
+      {% if b.last_update %}<div class="sub small mono-text">{{ b.last_update }}</div>{% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr>
+    <th scope="row">Bridge</th>
+    <td><span class="badge muted">Not reported yet</span> <span class="sub">The host reports every 5 minutes. If this stays, run <code>./bridgekeep doctor</code> on the host.</span></td>
+  </tr>
+  {% endif %}
+  </tbody>
+</table>
+
+<h2 class="section">Mail analyzer</h2>
+<table class="rows">
+  <tbody>
+  <tr>
+    <th scope="row">Analyzer</th>
+    <td>
+    {% if health.state == "not_set_up" %}
+      <span class="badge muted">Not set up</span> <span class="sub">Run <code>./bridgekeep setup --analyzer</code> on the host.</span>
+    {% elif health.state == "ok" %}
+      <span class="badge safe">✓ Running</span> <span class="sub">Last check {{ health.ts | ago }}</span>
+    {% elif health.state == "stalled" %}
+      <span class="badge trash">✗ Stalled</span> <span class="sub">No check since {{ health.ts | ago }}. Run <code>./bridgekeep doctor</code>.</span>
+    {% elif health.state == "bridge_unreachable" %}
+      <span class="badge trash">✗ Can't reach Bridge</span> <span class="sub">{{ health.detail }}</span>
+    {% elif health.state == "retrying" %}
+      <span class="badge review">! Retrying</span> <span class="sub">{{ health.detail }}</span>
+    {% else %}
+      <span class="badge review">! Unknown</span> <span class="sub">Run <code>./bridgekeep doctor</code>.</span>
+    {% endif %}
+    </td>
+  </tr>
+  {% if health.state != "not_set_up" %}
+  <tr>
+    <th scope="row">Pause</th>
+    <td>
+      {% if paused %}
+      <span class="badge review">! Paused</span> <span class="sub">The analyzer checks nothing until you resume.</span>
+      <form method="post" action="/analyzer/resume" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Resume</button></form>
+      {% else %}
+      <form method="post" action="/analyzer/pause" class="inline"><input type="hidden" name="csrf" value="{{ csrf }}"><button {{ "disabled" if not config_writable }}>Pause the analyzer</button></form>
+      <span class="sub">It stops checking mail until you resume.</span>
+      {% if not config_writable %}<span class="sub">Run <code>./bridgekeep setup</code> on the host to enable this.</span>{% endif %}
+      {% endif %}
+    </td>
+  </tr>
+  {% endif %}
+  <tr>
+    <th scope="row">Mode</th>
+    <td>{% if health.state == "not_set_up" %}<span class="sub">Not running</span>{% elif health.mode == "live" %}Live{% else %}Shadow: the analyzer logs what it would do and moves nothing{% endif %}</td>
+  </tr>
+  {% if health.state != "not_set_up" and (health.model or health.spend is not none) %}
+  <tr>
+    <th scope="row">AI model</th>
+    <td>
+      {% if health.model == "off" %}Off: rules and lists only
+      {% elif health.model == "no_key" %}<span class="badge muted">No API key</span> Rules and lists only. <a href="{{ '/analyzer#api-key' if health.provider in ('', 'anthropic') else '/analyzer/vendor' }}">Add a key</a>
+      {% elif health.model == "no_price" %}<span class="badge muted">No price</span> Rules and lists only until the model's prices are set. <a href="/analyzer/vendor">Add prices</a>
+      {% elif health.model == "budget_cap" %}<span class="badge review">! Budget reached</span> Rules only until next month
+      {% elif health.model.startswith("rate_cap") %}<span class="badge review">! Paused</span> Hourly or daily limit reached; rules only for now
+      {% else %}On{% endif %}
+      {% if health.provider_label %}<span class="sub"> · {{ health.provider_label }}{% if health.model_name %}, {{ health.model_name }}{% endif %}</span>{% endif %}
+      {% if health.spend is not none %}<span class="sub"> · ${{ "%.2f"|format(health.spend) }}{% if health.budget is not none %} of ${{ "%.0f"|format(health.budget) }}{% endif %} this month</span>{% endif %}
+    </td>
+  </tr>
+  {% endif %}
+  {% if card %}
+  <tr>
+    <th scope="row">Last 14 days</th>
+    <td>
+      {{ "{:,}".format(card.seen) }} messages checked: {{ card.quarantine }} would go to trash, {{ card.review }} for you to review{% if card.protected %}, {{ card.protected }} protected senders kept{% endif %}.
+      {% if card.errors %}<span class="badge review">! {{ card.errors }} errors</span>{% endif %}
+      <div><a href="/review">Review</a> · <a href="/log">See everything it handled</a></div>
+    </td>
+  </tr>
+  {% endif %}
+  </tbody>
+</table>
+
+<h2 class="section">Storage</h2>
+<table class="rows">
+  <tbody>
+  {% if st %}
+  {% for label, value in st.rows %}
+  <tr><th scope="row">{{ label }}</th><td>{{ value }}</td></tr>
+  {% endfor %}
+  <tr>
+    <th scope="row">Disk</th>
+    <td>
+      {% if st.low %}<span class="badge trash">✗ Low</span> {% endif %}{{ st.free }} free of {{ st.total }}{% if st.path %} on <code>{{ st.path }}</code>{% endif %}
+      {% if st.used_pct is not none %}<span class="disk-used"><meter min="0" max="100" low="80" high="90" optimum="0" value="{{ 95 if st.low and st.used_pct < 95 else st.used_pct }}" class="disk{{ ' low' if st.low }}" aria-hidden="true"></meter> <span class="sub">{{ st.used_pct }}% used</span></span>{% endif %}
+      {% if st.low %}<div class="sub">Free some space, or Bridge will stop syncing when it runs out.</div>{% endif %}
+    </td>
+  </tr>
+  {% else %}
+  <tr><th scope="row">Storage</th><td><span class="badge muted">Not reported yet</span> <span class="sub">The host reports every 5 minutes.</span></td></tr>
+  {% endif %}
+  </tbody>
+</table>
+
+<h2 class="section">This portal</h2>
+<table class="rows">
+  <tbody>
+  <tr>
+    <th scope="row">Access</th>
+    <td>{% if lan %}Your home network: {% for u in urls %}<code>{{ u }}</code>{{ ", " if not loop.last }}{% endfor %}{% else %}This computer only (<code>{{ urls[0] }}</code>). <span class="sub">To open it from other devices at home, see Settings.</span>{% endif %}</td>
+  </tr>
+  <tr>
+    <th scope="row">Versions</th>
+    <td>{% include "_versions.html" %}{% if versions.update_ready or (not versions.trees_known and versions.bridgekeep and versions.bridgekeep != version) %} <span class="badge review">! Update ready</span> <span class="sub">Run <code>./bridgekeep setup</code> on the host to apply it{% if versions.update_ready %} (the {{ versions.update_ready | join(" and ") }}){% endif %}.</span>{% endif %}</td>
+  </tr>
+  {% if host.docker is defined %}
+  <tr>
+    <th scope="row">Docker</th>
+    <td>{{ host.docker.version }}{% if host.docker.old %} <span class="badge review">! Older than 28</span> <span class="sub">The portal can reach the internet, and in local mode other devices on your network may reach it too. Update Docker Engine.</span>{% endif %}</td>
+  </tr>
+  {% endif %}
+  </tbody>
+</table>
+</details>
+{% endblock %}

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bridgekeep-portal"
+version = "0.1.0"
+description = "Bridgekeep's self-hosted admin portal (localhost only by default)"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.12"
+# Exact pins live in requirements.txt (with hashes) for the image.
+dependencies = ["Jinja2>=3.1,<4", "argon2-cffi>=25,<26", "segno>=1.6,<2"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+portal = ["BUILD_COMMIT", "templates/*.html", "static/*", "data/*", "web_dist/*.html", "web_dist/assets/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

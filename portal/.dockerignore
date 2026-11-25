@@ -1,0 +1,7 @@
+tests/
+reports/
+**/__pycache__/
+.pytest_cache/
+web/node_modules/
+src/portal/web_dist/
+src/*.egg-info/

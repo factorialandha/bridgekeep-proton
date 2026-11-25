@@ -1,0 +1,292 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/factorialandha/github-ci/main/schemas/pipeline.schema.json
+when: { branch: [main, preview], paths-ignore: ["**/*.md", "docs/**"] }
+
+schedules:
+  # Daily: rebuild and rescan (picks up Debian security fixes) and check
+  # Proton's stable release notes for a newer Bridge.
+  daily:
+    cron: "17 5 * * *"
+    timezone: UTC
+    branch: main
+    description: Daily rebuild, vulnerability scan and upstream Bridge check
+
+jobs:
+  shellcheck:
+    when: { paths-ignore: ["analyzer/**", "portal/**", "tests/portal-smoke.sh"] }
+    runs-on: linux
+    timeout: 10m
+    image: koalaman/shellcheck-alpine@sha256:c82fe42504fbc9fc68f15d36638e5ee2324ebb8b94e96a3c4e395bf361c49183
+    script: shellcheck docker/entrypoint.sh docker/verify-deb.sh docker/build-bridge-source.sh scripts/*.sh tests/*.sh deploy/proxmox/*.sh tests/proxmox/*
+
+  # The sign-in helper against a stand-in for Bridge's CLI (same ishell and
+  # readline versions, Bridge's exact prompts). No Proton account involved.
+  signin:
+    when: { paths-ignore: ["analyzer/**", "portal/**", "tests/portal-smoke.sh"] }
+    runs-on: linux
+    timeout: 10m
+    image: golang@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0  # golang:1.26-bookworm
+    script: GOTOOLCHAIN=local tests/signin.sh
+
+  # The portal's sign-in broker (broker/) against the same Bridge CLI stand-in.
+  broker:
+    when: { paths-ignore: ["analyzer/**", "portal/**"] }
+    runs-on: linux
+    timeout: 10m
+    image: golang@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0  # golang:1.26-bookworm
+    script: GOTOOLCHAIN=local tests/broker.sh
+
+  # Discord alerts and the portal's secret drop box against a stand-in for curl: no network, no webhook.
+  notify:
+    runs-on: linux
+    timeout: 5m
+    image: golang@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0  # golang:1.26-bookworm
+    script: tests/notify.sh && tests/secret-requests.sh
+
+  # ./bridgekeep on a Proxmox VE host (deploy/proxmox/proxmox.sh) against
+  # stand-ins for pct, pvesm and pveam: no Proxmox, no containers, no network.
+  proxmox:
+    when: { paths: ["bridgekeep", "deploy/proxmox/**", "tests/proxmox.sh", "tests/proxmox/**", "Makefile", "ci/pipeline.yml"] }
+    runs-on: linux
+    timeout: 5m
+    image: golang@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0  # golang:1.26-bookworm (bash, git)
+    script: tests/proxmox.sh
+
+  # A fresh checkout holds only tracked files, so anything found here was
+  # committed by mistake. Secrets live outside the checkout (BRIDGEKEEP_SECRETS).
+  no-secrets:
+    runs-on: linux
+    timeout: 5m
+    image: koalaman/shellcheck-alpine@sha256:c82fe42504fbc9fc68f15d36638e5ee2324ebb8b94e96a3c4e395bf361c49183
+    script: |
+      found=$(find . -path ./.git -prune -o \( -path ./secrets -o -path ./config -o -name .env \
+        -o -name '*.pem' -o -name '*.key' -o -name 'bridge_password' -o -name 'anthropic_api_key' -o -name 'openai_api_key' -o -name 'gemini_api_key' -o -name 'local_api_key' \
+        -o -name 'analyzer_imap_token' \) -print)
+      if [ -n "$found" ]; then echo "Committed secrets or local config:"; echo "$found"; exit 1; fi
+      echo "no secrets or local config in the checkout"
+
+  hadolint:
+    runs-on: linux
+    timeout: 10m
+    image: hadolint/hadolint@sha256:9a3944b7fddcb947d1ffd90829ac1a6e5c30479223358f249d8b96c7d0019e27
+    script: hadolint Dockerfile analyzer/Dockerfile portal/Dockerfile
+
+  # Host Docker is available to protected runs only, which is all this
+  # pipeline ever runs (main and preview).
+  image:
+    needs: [shellcheck, hadolint, broker]
+    when: { paths-ignore: ["analyzer/**", "portal/**", "tests/portal-smoke.sh"] }
+    runs-on: linux
+    timeout: 45m
+    retry: { max: 1, when: infrastructure }
+    steps:
+      - name: Build Bridge from the pinned, hash-checked source (amd64)
+        run: make build IMAGE=proton-bridge-ci TAG=${OUTPOST_COMMIT}
+      - name: Smoke test (non-root, read-only, keychain, IMAP/SMTP via forwarder)
+        run: make test IMAGE=proton-bridge-ci
+      - name: Vulnerability scan (HIGH/CRITICAL with a fix available fails the job)
+        run: make scan IMAGE=proton-bridge-ci
+      - name: Clean up
+        if: always()
+        run: docker image rm -f proton-bridge-ci:local "proton-bridge-ci:${OUTPOST_COMMIT}" || true
+
+  # Proton's signed .deb, the alternative amd64 build (BRIDGE_BUILD=deb).
+  image-deb:
+    needs: [shellcheck, hadolint]
+    when: { paths-ignore: ["analyzer/**", "portal/**", "tests/portal-smoke.sh"] }
+    runs-on: linux
+    timeout: 30m
+    retry: { max: 1, when: infrastructure }
+    steps:
+      - name: Build from the pinned, signature-checked .deb
+        run: make build BRIDGE_BUILD=deb IMAGE=proton-bridge-ci-deb TAG=${OUTPOST_COMMIT}
+      - name: Smoke test
+        run: make test IMAGE=proton-bridge-ci-deb
+      - name: Clean up
+        if: always()
+        run: docker image rm -f proton-bridge-ci-deb:local "proton-bridge-ci-deb:${OUTPOST_COMMIT}" || true
+
+  # No arm64 worker: cross-compile Bridge for arm64 and check the binary. The
+  # arm64 image itself is built (and smoke-tested by auto-update) on the host.
+  arm64-binary:
+    needs: [shellcheck, hadolint]
+    when: { paths-ignore: ["analyzer/**", "portal/**", "tests/portal-smoke.sh"] }
+    runs-on: linux
+    timeout: 45m
+    retry: { max: 1, when: infrastructure }
+    script: make check-arm64
+
+  # AI analyzer: unit tests (adversarial set included), then the image.
+  analyzer-test:
+    runs-on: linux
+    timeout: 15m
+    when: { paths: ["analyzer/**", "ci/pipeline.yml", "Makefile"] }
+    image: python:3.13-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+    steps:
+      - run: "pip install -q --require-hashes --only-binary=:all: -r analyzer/requirements-test.txt"
+      - run: cd analyzer && python -m pytest -q --junitxml=reports/junit.xml
+      - uses: test-results
+        with: { files: analyzer/reports/*.xml }
+
+  analyzer-image:
+    needs: [analyzer-test]
+    runs-on: linux
+    timeout: 20m
+    when: { paths: ["analyzer/**", "ci/pipeline.yml", "Makefile"] }
+    retry: { max: 1, when: infrastructure }
+    steps:
+      - name: Build
+        run: make analyzer-build ANALYZER_IMAGE=proton-analyzer-ci
+      - name: Smoke test (offline, read-only, no capabilities)
+        run: make analyzer-smoke ANALYZER_IMAGE=proton-analyzer-ci
+      - name: Vulnerability scan
+        run: make analyzer-scan ANALYZER_IMAGE=proton-analyzer-ci
+      - name: Clean up
+        if: always()
+        run: docker image rm -f proton-analyzer-ci:local || true
+
+  # Admin portal: unit tests (auth, CSRF, Host allowlist, escaping), then the image.
+  portal-test:
+    runs-on: linux
+    timeout: 15m
+    when: { paths: ["portal/**", "analyzer/src/analyzer/lists.py", "analyzer/src/analyzer/text.py", "analyzer/src/analyzer/store.py", "analyzer/src/analyzer/settings.py", "ci/pipeline.yml", "Makefile"] }   # the portal vendors lists.py/text.py, reads store.py's layout, and must match settings.py's keys
+    image: python:3.13-slim-trixie@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+    steps:
+      - run: "pip install -q --require-hashes --only-binary=:all: -r portal/requirements-test.txt"
+      - run: cd portal && python -m pytest -q --junitxml=reports/junit.xml
+      - uses: test-results
+        with: { files: portal/reports/*.xml }
+
+  # Admin portal frontend (portal/web): supply-chain rules, audit, type check and build.
+  portal-web:
+    runs-on: linux
+    timeout: 10m
+    when: { paths: ["portal/web/**", "ci/pipeline.yml"] }
+    image: node:22-trixie-slim@sha256:f0960f8dc047f358e3fb428f36ccba21732194fa5f0cac849f401e63e62fb9e6
+    steps:
+      - run: cd portal/web && node check.mjs
+      - run: cd portal/web && npm ci --ignore-scripts --no-fund
+      - run: cd portal/web && npm audit --omit=dev --audit-level=high
+      - run: cd portal/web && node --test src/lib/utils.test.ts
+      - run: cd portal/web && npm run build && node check.mjs --dist
+
+  portal-image:
+    needs: [portal-test, portal-web]
+    runs-on: linux
+    timeout: 20m
+    when: { paths: ["portal/**", "tests/portal-smoke.sh", "ci/pipeline.yml", "Makefile"] }
+    retry: { max: 1, when: infrastructure }
+    steps:
+      - name: Build
+        run: make portal-build PORTAL_IMAGE=bridgekeep-portal-ci
+      - name: Smoke test (read-only, no capabilities, claim code, healthz)
+        run: make portal-smoke PORTAL_IMAGE=bridgekeep-portal-ci
+      - name: Vulnerability scan
+        run: make portal-scan PORTAL_IMAGE=bridgekeep-portal-ci
+      - name: Clean up
+        if: always()
+        run: docker image rm -f bridgekeep-portal-ci:local || true
+
+  # Private, signed amd64+arm64 images on ghcr.io (images.env), so hosts can
+  # pull instead of building. Only after the image's own build, smoke test and
+  # scan passed, and only from main/preview (protected runs: secrets and host
+  # Docker exist nowhere else). Main has its own signing key (owner decision,
+  # 2026-11-25): preview signs with the shared Outpost secrets
+  # COSIGN_PRIVATE_KEY/COSIGN_PASSWORD (keys/cosign.pub), main with
+  # COSIGN_MAIN_PRIVATE_KEY/COSIGN_MAIN_PASSWORD (keys/cosign-main.pub), which
+  # exist only in the main-signing environment, limited to the main branch, so
+  # a preview run can't read them even if a change asks for them. Only the
+  # two publish-*-main jobs name that environment. Every signature carries
+  # repo=, branch= and commit=, and hosts check all three against their
+  # branch's key (scripts/pull-image.sh). See docs/images.md.
+  # Proves Outpost keeps main's key from preview runs (docs/images.md,
+  # 'One-time setup', step 5). A manual preview run that names the
+  # main-signing environment must be refused, skipped, or get an empty
+  # secret. The value is only tested for emptiness, never printed.
+  main-signing-canary:
+    when: { branch: preview, event: manual }
+    runs-on: linux
+    timeout: 5m
+    environment: main-signing
+    env:
+      CANARY_KEY: ${{ secrets.COSIGN_MAIN_PRIVATE_KEY }}
+    script: |
+      if [ -n "${CANARY_KEY:-}" ]; then
+        echo "::error::A preview run could read COSIGN_MAIN_PRIVATE_KEY. Delete the main-signing secrets now; see docs/images.md."
+        exit 1
+      fi
+      echo "main-signing-canary: preview run got no main signing key (good)"
+
+  publish-bridge-preview:
+    needs: [image, image-deb, arm64-binary]
+    when: { branch: preview, event: [push, schedule, manual], paths-ignore: ["analyzer/**", "portal/**", "tests/portal-smoke.sh"] }
+    runs-on: linux
+    timeout: 90m
+    retry: { max: 1, when: infrastructure }
+    permissions: { contents: read, packages: write }
+    env:
+      GHCR_USER: factorialandha          # the account that owns the packages
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}   # classic token, write:packages (the run token is refused by ghcr.io)
+      COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+      COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+    script: bash scripts/publish-images.sh bridge
+
+  publish-bridge-main:
+    needs: [image, image-deb, arm64-binary]
+    when: { branch: main, event: [push, schedule, manual], paths-ignore: ["analyzer/**", "portal/**", "tests/portal-smoke.sh"] }
+    runs-on: linux
+    timeout: 90m
+    retry: { max: 1, when: infrastructure }
+    permissions: { contents: read, packages: write }
+    environment: main-signing            # holds main's key; branch rule: main only
+    env:
+      GHCR_USER: factorialandha          # the account that owns the packages
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}   # classic token, write:packages (the run token is refused by ghcr.io)
+      COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_MAIN_PRIVATE_KEY }}   # main's own key, not the shared one
+      COSIGN_PASSWORD: ${{ secrets.COSIGN_MAIN_PASSWORD }}
+    script: bash scripts/publish-images.sh bridge
+
+  publish-analyzer-preview:
+    needs: [analyzer-image]
+    when: { branch: preview, event: [push, schedule, manual], paths: ["analyzer/**", "ci/pipeline.yml", "images.env", "keys/cosign.pub"] }
+    runs-on: linux
+    timeout: 45m
+    retry: { max: 1, when: infrastructure }
+    permissions: { contents: read, packages: write }
+    env:
+      GHCR_USER: factorialandha          # the account that owns the packages
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}   # classic token, write:packages (the run token is refused by ghcr.io)
+      COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+      COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+    script: bash scripts/publish-images.sh analyzer
+
+  publish-analyzer-main:
+    needs: [analyzer-image]
+    when: { branch: main, event: [push, schedule, manual], paths: ["analyzer/**", "ci/pipeline.yml", "images.env", "keys/cosign-main.pub"] }
+    runs-on: linux
+    timeout: 45m
+    retry: { max: 1, when: infrastructure }
+    permissions: { contents: read, packages: write }
+    environment: main-signing            # holds main's key; branch rule: main only
+    env:
+      GHCR_USER: factorialandha          # the account that owns the packages
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}   # classic token, write:packages (the run token is refused by ghcr.io)
+      COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_MAIN_PRIVATE_KEY }}   # main's own key, not the shared one
+      COSIGN_PASSWORD: ${{ secrets.COSIGN_MAIN_PASSWORD }}
+    script: bash scripts/publish-images.sh analyzer
+
+  upstream-check:
+    runs-on: linux
+    timeout: 10m
+    image: debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+    when: { event: [schedule, manual] }
+    continue-on-error: true
+    script: |
+      apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl jq >/dev/null
+      set +e
+      out=$(scripts/update-bridge.sh --check); rc=$?
+      echo "$out"
+      if [ $rc -eq 10 ]; then
+        echo "::warning::A newer Proton Bridge is out ($out). Run scripts/update-bridge.sh and open a PR into preview."
+        exit 1
+      fi
+      exit $rc

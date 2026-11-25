@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+[[ "$1 $2" == "link show" ]] && { [[ $3 == vmbr0 ]]; exit; }
+exec /usr/sbin/ip "$@" 2>/dev/null || exec /sbin/ip "$@"

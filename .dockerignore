@@ -1,0 +1,14 @@
+.git
+*.md
+docs/
+ci/
+tests/
+bridge-cert.pem
+*.tar.gpg
+.env
+.build/
+.bridgekeep/
+secrets/
+config/
+mail-eval/
+*.pem

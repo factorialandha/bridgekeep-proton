@@ -1,0 +1,77 @@
+# Analyzer configuration. Copy to config/analyzer.yaml and edit.
+# Anything missing or invalid falls back to the safe default: shadow mode.
+
+mode: shadow            # always shadow here. Live mode (moving mail) is switched on in the portal's
+                        # Analyzer page, and off there or with: ./bridgekeep analyzer shadow
+
+thresholds:             # leave these until the dry run has produced data
+  quarantine: 0.97      # spam/phishing at or above this would go to AI-Quarantine
+  review: 0.70          # from here up to `quarantine` would go to AI-Review
+
+folders:                      # Proton folders (Folders/AI-... over IMAP); the analyzer creates them
+  quarantine: AI-Quarantine   # never Trash: Proton can auto-empty Trash
+  review: AI-Review
+  digest: AI-Digest
+
+model:
+  enabled: true               # false: rules and lists only, nothing is sent anywhere
+  # Who analyzes the mail. Set by `./bridgekeep setup` or the portal (host
+  # side, with step-up), not by hand: anthropic (default), openai, gemini, or
+  # local (your own OpenAI-compatible server, e.g. Ollama).
+  provider: anthropic
+  name: claude-haiku-5-5
+  # endpoint: http://192.168.1.50:11434/v1   # local only: the server's IP, never a name
+  # price_in_per_mtok: 0.10   # USD per million tokens; needed for openai/gemini models
+  # price_out_per_mtok: 0.50
+  # The key is read from /run/secrets/<provider>_api_key, one file per vendor.
+  monthly_budget_usd: 20      # at the cap: no more model calls this month, rules and lists only (about $0.0001 a message)
+  proxy: http://egress-proxy:3128   # the only way out in the compose setup; remove for a plain `docker run`
+
+limits:
+  max_per_hour: 120           # global caps; when hit, mail is left alone, not classified
+  max_per_day: 1000
+  max_moves_per_day: 200      # live mode: moves a day; then log only until midnight UTC (0 = never move)
+  body_chars: 3000            # body text sent to the model is cut to this length
+
+imap:                         # used by `analyzer run` (read-only: EXAMINE + BODY.PEEK)
+  host: imap-proxy            # the allowlist proxy below, never Bridge itself
+  port: 1143
+  tls: none                   # plain text on the proxy's private network; starttls to talk to Bridge directly
+  username: analyzer          # ignored by the proxy
+  password_file: /run/secrets/analyzer_imap_token
+  cert_file: /config/bridge-cert.pem   # only used with tls: starttls
+  folder: INBOX
+  poll_seconds: 60
+
+# The proxy holds the Bridge password; the analyzer never sees it. It
+# forwards only EXAMINE, UID SEARCH and UID FETCH with BODY.PEEK, on these
+# folders. Run with `analyzer imap-proxy`.
+imap_proxy:
+  listen_port: 1143
+  upstream_host: bridge
+  upstream_port: 1143
+  username: you@proton.me     # the Bridge account address
+  password_file: /run/secrets/bridge_password
+  cert_file: /config/bridge-cert.pem   # config/bridge-cert.pem on the host; `make analyzer-init` exports it
+  token_file: /run/secrets/analyzer_imap_token   # the same token the analyzer uses
+  folders: [INBOX]
+
+lists_dir: /config/lists
+db: /data/analyzer.db
+pause_file: /config/PAUSE     # kill switch: if this file exists, nothing is ever moved
+portal_dir: /config/portal    # the admin portal's folder: portal.yaml (never-trash list) and its own PAUSE
+health_file: /data/health.json
+
+log:
+  store_subjects: true        # false stores only a hash of each subject
+  retention_days: 90
+
+# Authentication-Results headers are only trusted from these authserv-ids.
+# Check yours: `analyzer check some-real-message.eml` prints the one it saw.
+trusted_authserv: [protonmail.ch, proton.me, protonmail.com]
+
+# The analyzer's networks have no route out; this proxy is the only exit and
+# it allows CONNECT to exactly one host:port, the chosen provider's
+# (model.provider above). Run with `analyzer egress-proxy`.
+egress_proxy:
+  listen_port: 3128

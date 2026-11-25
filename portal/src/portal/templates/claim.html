@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Claim{% endblock %}
+{% block gate %}
+<h1>Claim this portal</h1>
+<p class="lead">Enter the one-time code from the terminal where you ran setup. It proves you're the person who set up this host.</p>
+{% include "_error.html" %}
+<form method="post" action="/claim" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <label for="code">Claim code</label>
+  <input id="code" name="code" class="mono" required autofocus spellcheck="false" autocapitalize="characters"
+         placeholder="XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" maxlength="40">
+  <button class="primary">Continue</button>
+</form>
+<p class="hint">Lost it? On the host, run <code>./bridgekeep portal code</code> for a new one.</p>
+{% endblock %}

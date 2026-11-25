@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}Use {{ v.label }}?{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/analyzer">Analyzer</a> / <a href="/analyzer/vendor">AI vendor</a> / Confirm</p>
+<h1>Use {{ v.label }}?</h1>
+<p class="nudge" role="note">{{ disclosure }}</p>
+{% if current.provider != f.provider %}<p>Mail fields will go to {{ v.label }} instead of {{ current.label or current.provider }}.</p>{% endif %}
+<div class="table-wrap"><table class="data">
+  <tr><th scope="row">Model</th><td><code>{{ f.model }}</code></td></tr>
+  {% if f.endpoint %}<tr><th scope="row">Server</th><td><code>{{ f.endpoint }}</code></td></tr>{% endif %}
+  {% if f.price_in %}<tr><th scope="row">Prices</th><td>${{ f.price_in }} in, ${{ f.price_out }} out, per million tokens</td></tr>{% endif %}
+</table></div>
+{% if key_error %}<p class="error" role="alert">{{ key_error }}</p>{% endif %}
+<form method="post" action="/analyzer/vendor" class="narrow" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="back" value="/analyzer/vendor">
+  {% for k in ("provider", "model", "endpoint", "price_in", "price_out") %}<input type="hidden" name="{{ k }}" value="{{ f[k] }}">{% endfor %}
+  <label for="vendor-key">API key for {{ v.label }}</label>
+  <input id="vendor-key" name="value" type="password" autocomplete="off" spellcheck="false" maxlength="220" placeholder="{{ v.key_placeholder }}">
+  <p class="hint">Leave it empty to keep the key already saved for {{ v.label }}. If there isn't one{% if f.provider == "local" %} and your server needs one{% endif %}, the host doesn't change anything and says why on the AI vendor page.{% if f.provider == "local" %} Most home servers don't need a key.{% endif %} Make a key just for Bridgekeep, with a spend limit. The portal never shows it again.</p>
+  <p class="hint">The host applies this within 5 minutes and tells your Discord channel first. One change every 10 minutes.</p>
+  <button class="primary">Use {{ v.label }}</button>
+</form>
+<a href="/analyzer/vendor" class="spaced">Cancel</a>
+{% endblock %}

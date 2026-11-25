@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+echo "pveam $*" >>"$PX/log"
+case $1 in
+  list) echo "NAME SIZE"; for f in "$PX"/tmpl/*; do [[ -f $f ]] && echo "$2:vztmpl/$(basename "$f") 120MB"; done; true ;;
+  update) ;;
+  available) [[ -n ${MOCK_NO_TEMPLATES:-} ]] && exit 0
+    printf 'system          debian-12-standard_12.7-1_%s.tar.zst\nsystem          debian-13-standard_13.1-2_%s.tar.zst\nsystem          alpine-3.22-default_20250617_%s.tar.xz\n' "$MOCK_ARCH" "$MOCK_ARCH" "$MOCK_ARCH" ;;
+  download) mkdir -p "$PX/tmpl"; touch "$PX/tmpl/$3" ;;
+esac

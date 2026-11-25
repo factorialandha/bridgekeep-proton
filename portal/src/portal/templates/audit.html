@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Audit log{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/settings">Settings</a> / Audit log</p>
+<h1>Audit log</h1>
+<p class="sub">Newest first. Secrets are never recorded.</p>
+<div class="table-wrap">
+<table class="data">
+  <thead><tr><th scope="col">Time</th><th scope="col">Action</th><th scope="col">Target</th><th scope="col">From</th><th scope="col">Result</th></tr></thead>
+  <tbody>
+  {% for r in rows %}
+  <tr>
+    <td class="num">{{ r.ts | when }}</td>
+    <td>{{ r.action }}</td>
+    <td class="mono">{{ r.target }}</td>
+    <td class="mono">{{ r.ip }}</td>
+    <td>{% if r.result == "ok" %}<span class="badge safe">✓ ok</span>{% else %}<span class="badge trash">✗ {{ r.result }}</span>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="5" class="sub">Nothing yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% endblock %}

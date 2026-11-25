@@ -1,0 +1,78 @@
+# TrueNAS SCALE (24.10 and later): keep Bridge's data on a ZFS dataset.
+#
+# Layered over ../../compose.yaml by COMPOSE_FILE in the repo's .env, so
+# `docker compose ...`, scripts/make.sh and scripts/auto-update.sh all pick
+# it up without extra flags (docs/truenas.md):
+#
+#   COMPOSE_FILE=compose.yaml:deploy/truenas/compose.truenas.yaml
+#   BRIDGEKEEP_DATA=/mnt/tank/bridgekeep/data
+#   BRIDGEKEEP_SECRETS=/mnt/tank/bridgekeep/secrets
+#
+# The only changes from the plain compose file: the named volumes become
+# folders on a dataset you choose (an encrypted one), so ZFS snapshots and
+# replication cover the login, and the analyzer's secrets move there too.
+# Everything else, including the hardening and the private networks, comes
+# from compose.yaml unchanged.
+#
+# create_host_path is off on purpose: Docker would create a missing folder
+# owned by root, which the container's user (10001) cannot write. The
+# setup step in docs/truenas.md creates the folders with the right owner.
+
+services:
+  bridge:
+    volumes:
+      - &bridge-data
+        type: bind
+        source: ${BRIDGEKEEP_DATA:?set BRIDGEKEEP_DATA in .env (docs/truenas.md)}/bridge
+        target: /home/bridge
+        bind:
+          create_host_path: false
+
+  bridge-init:
+    volumes:
+      - *bridge-data
+
+  analyzer:
+    volumes:
+      - type: bind
+        source: ${BRIDGEKEEP_DATA:?set BRIDGEKEEP_DATA in .env (docs/truenas.md)}/analyzer
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BRIDGEKEEP_DATA:?set BRIDGEKEEP_DATA in .env (docs/truenas.md)}/portal-config
+        target: /config/portal
+        read_only: true
+        bind:
+          create_host_path: false
+
+  portal:
+    volumes:
+      - type: bind
+        source: ${BRIDGEKEEP_DATA:?set BRIDGEKEEP_DATA in .env (docs/truenas.md)}/portal
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BRIDGEKEEP_DATA:?set BRIDGEKEEP_DATA in .env (docs/truenas.md)}/analyzer
+        target: /analyzer
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BRIDGEKEEP_DATA:?set BRIDGEKEEP_DATA in .env (docs/truenas.md)}/portal-config
+        target: /portal-config
+        bind:
+          create_host_path: false
+
+# The analyzer's secrets live outside the git checkout, in a root-owned
+# folder on the same encrypted dataset (/etc on TrueNAS is reset by system
+# upgrades, so it is no place for them). scripts/make.sh analyzer-init
+# writes them there.
+secrets:
+  bridge_password:
+    file: ${BRIDGEKEEP_SECRETS:?set BRIDGEKEEP_SECRETS in .env (docs/truenas.md)}/bridge_password
+  analyzer_imap_token:
+    file: ${BRIDGEKEEP_SECRETS:?set BRIDGEKEEP_SECRETS in .env (docs/truenas.md)}/analyzer_imap_token
+  anthropic_api_key:
+    file: ${BRIDGEKEEP_SECRETS:?set BRIDGEKEEP_SECRETS in .env (docs/truenas.md)}/anthropic_api_key

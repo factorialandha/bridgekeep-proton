@@ -1,0 +1,5 @@
+# Edit, then regenerate the hashed lock files:
+#   pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements.txt requirements.in
+#   pip-compile --generate-hashes --strip-extras --allow-unsafe -o requirements-test.txt requirements-test.in
+anthropic==2.6.0
+PyYAML==6.0.3

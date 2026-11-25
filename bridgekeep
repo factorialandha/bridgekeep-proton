@@ -1,0 +1,1340 @@
+#!/usr/bin/env bash
+# Bridgekeep: one command from a fresh host to a running, signed-in Bridge.
+#
+#   ./bridgekeep setup        check the host, get Bridge, sign in, start, schedule updates
+#                             (--build: build here instead of downloading the signed image)
+#   ./bridgekeep status       health, signed-in address, sync progress, updates
+#   ./bridgekeep doctor       rerun the checks and print a fix for each failure
+#   ./bridgekeep credentials  show the IMAP/SMTP username and password once
+#   ./bridgekeep relogin      sign in to Proton again (after an expired session)
+#   ./bridgekeep logs         follow Bridge's log
+#   ./bridgekeep update       check for, build and test a new Bridge now (doesn't deploy)
+#   ./bridgekeep deploy-update  swap in the tested update (keeps a rollback)
+#   ./bridgekeep feedback     how the AI compares with your corrections in the portal
+#   ./bridgekeep analyzer shadow  stop the analyzer moving mail (back to log only); works with the portal down
+#   ./bridgekeep backfill     analyze older mail, after a cost estimate: estimate
+#                             [--since YYYY-MM-DD] [--limit N] | start ID | pause | resume | cancel | status
+#   ./bridgekeep portal       the admin website: where to open it, and
+#                             portal code | reset-admin | network on | network off
+#   ./bridgekeep stop [bridge]   stop everything (or only Bridge) until start; alerts for it pause
+#   ./bridgekeep start [bridge]  start it again
+#   ./bridgekeep watch        the 5-minute health check (alerts, portal Status page):
+#                             install it if missing, then run one round now
+#   ./bridgekeep alerts       Discord alerts: on (paste a webhook) | off | test
+#
+# On a Proxmox VE host, every command runs in a Debian container that setup
+# makes for Bridgekeep (deploy/proxmox/proxmox.sh; ./bridgekeep shell opens it).
+#
+# To update Bridgekeep itself: git pull && ./bridgekeep setup (it rebuilds the
+# analyzer, the portal, and Bridge's image when Bridgekeep's part of it changed;
+# a new Bridge release from Proton still waits for deploy-update).
+#
+# setup is safe to run again: steps that already passed are skipped, and a
+# failed step prints its fix and resumes there next time. Tool output goes to
+# .bridgekeep/logs/, never to the screen unless a step fails. Secrets are
+# never printed or logged (the sign-in runs with Docker's log driver "none").
+set -euo pipefail
+export MSYS_NO_PATHCONV=1
+
+root=$(cd "$(dirname "$0")" && pwd -P)
+cd "$root"
+case $root in
+  *[\'\"\$\`\\]*|*[[:space:]]*) echo "bridgekeep: move this checkout to a folder whose path has no spaces or quotes (now: $root)" >&2; exit 1 ;;
+esac
+
+# A Proxmox VE host: Bridgekeep goes in its own container, not on the host.
+if [[ ${BRIDGEKEEP_PROXMOX:-} != off && -d /etc/pve ]] && command -v pct >/dev/null 2>&1; then
+  exec bash "$root/deploy/proxmox/proxmox.sh" "$@"
+fi
+
+state_dir=.bridgekeep
+log_dir=$state_dir/logs
+mkdir -p "$log_dir"
+chmod 700 "$state_dir" 2>/dev/null || true
+
+IMAGE=${IMAGE:-proton-bridge}
+NETWORK=proton-bridge_mail
+PYTHON_IMAGE=$(sed -n 's/^PYTHON_IMAGE *?= *//p' Makefile)
+YES=false
+FORCE_BUILD=false
+
+# --- output ------------------------------------------------------------------
+
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  B=$'\e[1m' G=$'\e[32m' R=$'\e[31m' Y=$'\e[33m' D=$'\e[2m' N=$'\e[0m'
+else
+  B='' G='' R='' Y='' D='' N=''
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$G" "$N" "$*"; }
+note() { printf '  %s!%s %s\n' "$Y" "$N" "$*"; }
+step() { printf '\n%s[%s/10] %s%s\n' "$B" "$1" "$2" "$N"; }
+# fail WHAT FIX: what is wrong, the exact fix, and how to carry on.
+fail() {
+  printf '  %s✗ %s%s\n' "$R" "$1" "$N" >&2
+  [[ -n ${2:-} ]] && printf '    Fix: %s\n' "$2" >&2
+  printf '    Then run %s./bridgekeep setup%s again; it carries on from here.\n' "$B" "$N" >&2
+  exit 1
+}
+show_log() { # last lines of a step log, on failure only
+  printf '%s' "$D" >&2; tail -n 20 "$1" >&2 || true; printf '%s' "$N" >&2
+  printf '    Full log: %s\n' "$1" >&2
+}
+ask() { # ask "Question" Y|N -> returns 0 for yes
+  local def=$1; shift
+  local hint="[y/N]"; [[ $def == Y ]] && hint="[Y/n]"
+  if $YES || [[ ! -t 0 ]]; then [[ $def == Y ]]; return; fi
+  local a; read -r -p "  $* $hint " a
+  a=${a:-$def}
+  [[ $a == [Yy]* ]]
+}
+# run_quiet LABEL LOGFILE CMD...: one line with a running clock, output to the log.
+run_quiet() {
+  local label=$1 logf=$2; shift 2
+  "$@" >"$logf" 2>&1 &
+  local pid=$! start=$SECONDS
+  if [[ -t 1 ]]; then
+    while kill -0 "$pid" 2>/dev/null; do
+      printf '\r  %s… %d:%02d ' "$label" $(((SECONDS - start) / 60)) $(((SECONDS - start) % 60))
+      sleep 1
+    done
+    printf '\r\e[K'
+  fi
+  wait "$pid"
+}
+
+done_mark() { touch "$state_dir/done-$1"; }
+# A service's code is the git tree of its folder. Setup rebuilds (or pulls) the
+# image whenever that changed since it last did, so git pull + setup updates it.
+# Never git as root (setup may run under sudo): scripts/versions.sh runs it as .git's owner or nobody.
+tree_of()     { bash scripts/versions.sh tree "$1" 2>/dev/null || echo none; }
+# An unknown tree ("none") always counts as changed: rebuilding is slow, but never stale.
+code_changed() { local now; now=$(tree_of "$1"); [[ $now == none || $(cat "$state_dir/tree-$1" 2>/dev/null) != "$now" ]]; }
+code_mark()   { tree_of "$1" >"$state_dir/tree-$1"; }
+is_done()   { [[ -f $state_dir/done-$1 ]]; }
+
+as_root() { if [[ $(id -u) == 0 ]]; then "$@"; else sudo "$@"; fi; }
+
+# --- where things live ---------------------------------------------------------
+
+load_env() {
+  SECRETS=/etc/bridgekeep/secrets    # outside the checkout, root-owned 0700
+  if [[ -f .env ]]; then
+    local s; s=$(sed -n 's/^BRIDGEKEEP_SECRETS=//p' .env | tail -n1)
+    [[ -n $s ]] && SECRETS=$s
+  fi
+  export BRIDGEKEEP_SECRETS=$SECRETS
+}
+is_truenas() { command -v midclt >/dev/null 2>&1; }
+in_lxc() { [[ $(systemd-detect-virt --container 2>/dev/null) == lxc ]] || grep -qa 'container=lxc' /proc/1/environ 2>/dev/null; }
+username() { as_root cat "$SECRETS/bridge_username" 2>/dev/null || true; }
+has_secret() { as_root test -f "$SECRETS/$1"; }
+put_secret() { # name; value on stdin. 0400, owned by the containers' user (10002).
+  # shellcheck disable=SC2016
+  as_root sh -c 'umask 077 && cat > "$1" && chown 10002:10002 "$1" && chmod 0400 "$1"' sh "$SECRETS/$1"
+}
+make_secrets_dir() { as_root install -d -m 0700 -o 0 -g 0 "$SECRETS"; }
+
+# --- checks shared by setup, status and doctor -----------------------------------
+
+bridge_health() {
+  local cid; cid=$(docker compose ps -q bridge 2>/dev/null || true)
+  [[ -n $cid ]] || { echo stopped; return; }
+  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null || echo stopped
+}
+
+# Bridge's certificate: from its files if it wrote one, else (Bridge 3 keeps it
+# in its vault) from the STARTTLS handshake, read by a throwaway container on
+# the internal mail network. That network read is trust-on-first-use, so it
+# happens once: bridge-cert.pem is the pin, and later runs only compare.
+read_cert() { # FILE: write Bridge's current certificate (PEM) to FILE
+  local rc=0
+  { docker compose exec -T bridge entrypoint export-cert 2>/dev/null \
+      || docker run --rm --network "$NETWORK" --read-only --cap-drop ALL \
+           --security-opt no-new-privileges:true --user 65534:65534 --log-driver none \
+           -v "$root/tests/fetch-cert.py:/w/fetch-cert.py:ro" \
+           "$PYTHON_IMAGE" python /w/fetch-cert.py 2>>"$log_dir/cert.log"
+  } > "$1.tmp" && grep -q "BEGIN CERTIFICATE" "$1.tmp" && mv "$1.tmp" "$1" || rc=1
+  rm -f -- "$1.tmp"; return $rc
+}
+cert_fp() { docker run --rm -i --log-driver none --network none --read-only --cap-drop ALL --user 65534:65534 "$PYTHON_IMAGE" python -c \
+  'import ssl,sys,hashlib; d=ssl.PEM_cert_to_DER_cert(sys.stdin.read()); h=hashlib.sha256(d).hexdigest().upper(); print(":".join(h[i:i+2] for i in range(0,64,2)))' <"$1"; }
+export_cert() { [[ -f bridge-cert.pem ]] || read_cert bridge-cert.pem; }
+# cert_pinned: 0 when Bridge still serves the pinned certificate. On a
+# mismatch it prints both fingerprints and returns 1; 2 if Bridge's certificate
+# can't be read at all. It never rewrites the pin.
+cert_pinned() {
+  local now=$state_dir/cert-now.pem rc=0
+  [[ -f bridge-cert.pem ]] || return 1
+  read_cert "$now" || return 2
+  if ! cmp -s <(sed -n '/BEGIN/,/END/p' bridge-cert.pem) <(sed -n '/BEGIN/,/END/p' "$now"); then
+    printf '    Pinned:  %s\n    Serving: %s\n' "$(cert_fp bridge-cert.pem)" "$(cert_fp "$now")" >&2
+    rc=1
+  fi
+  rm -f -- "$now"; return $rc
+}
+cert_fix="if you reinstalled Bridge or wiped its data, a new certificate is expected: delete bridge-cert.pem and run ./bridgekeep setup. Otherwise stop and find out what is answering as Bridge."
+
+# login_check: real IMAP login from a second container with the saved
+# credentials. Prints login-check.py's JSON line.
+login_check() {
+  local user pwfile owner
+  user=$(username)
+  pwfile=$SECRETS/bridge_password
+  [[ -n $user ]] && has_secret bridge_password || { echo '{"ok": false, "error": "no saved credentials"}'; return 1; }
+  [[ -f bridge-cert.pem ]] || export_cert || { echo '{"ok": false, "error": "cannot export the certificate"}'; return 1; }
+  owner=$(as_root stat -c %u:%g "$pwfile" 2>/dev/null || echo 10002:10002)
+  # After a sign-in from the portal, the broker's copy is the current one.
+  local cred=()
+  local vol; vol="$(sed -n 's/^name: *//p' compose.yaml)_bridge-credential"   # compose.yaml pins the project name
+  docker volume inspect "$vol" >/dev/null 2>&1 \
+    && cred=(-v "$vol":/c:ro --group-add 10011)
+  docker run --rm --network "$NETWORK" --read-only --cap-drop ALL \
+    --security-opt no-new-privileges:true --user "$owner" --log-driver none \
+    -v "$root/tests/login-check.py:/w/login-check.py:ro" \
+    -v "$root/bridge-cert.pem:/w/bridge-cert.pem:ro" \
+    -v "$pwfile:/run/pw:ro" "${cred[@]}" \
+    "$PYTHON_IMAGE" python /w/login-check.py --user "$user" --password-file /run/pw --cafile /w/bridge-cert.pem \
+    ${cred:+--credential-dir /c}
+}
+json_field() { sed -n "s/.*\"$1\": \"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p"; }
+
+# --- setup steps -----------------------------------------------------------------
+
+s1_host() {
+  step 1 "Checking this machine"
+  local logf=$log_dir/1-host.log
+  if ! bash scripts/preflight.sh >"$logf" 2>&1; then
+    local msg; msg=$(sed -n 's/^preflight: //p' "$logf" | tail -n1)
+    if grep -q "Compose v2 plugin\|buildx" "$logf" && command -v apt-get >/dev/null 2>&1 && ! is_truenas; then
+      local pkgs="docker-compose-v2 docker-buildx"
+      apt-cache show docker-compose-plugin >/dev/null 2>&1 && pkgs="docker-compose-plugin docker-buildx-plugin"
+      if ask Y "Docker Compose or buildx is missing. Install $pkgs now?"; then
+        as_root apt-get update -qq >>"$logf" 2>&1 && as_root apt-get install -y -qq $pkgs >>"$logf" 2>&1 \
+          || { show_log "$logf"; fail "Installing $pkgs failed." "sudo apt-get install $pkgs"; }
+        bash scripts/preflight.sh >"$logf" 2>&1 || { show_log "$logf"; fail "${msg:-The Docker check still fails.}"; }
+      else
+        fail "${msg:-Docker Compose or buildx is missing.}" "sudo apt-get install $pkgs"
+      fi
+    else
+      fail "${msg:-The Docker check failed.}" "$(grep -o 'Fix: .*' "$logf" | head -n1 | cut -c6-)"
+    fi
+  fi
+  { grep '^preflight: note:' "$logf" || true; } | sed 's/^preflight: note: //' | while read -r l; do note "$l"; done
+  ok "$(sed -n 's/^preflight: ok (\(.*\))$/Docker ready: \1/p' "$logf")"
+
+  local mem_kb disk_kb
+  mem_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+  if (( mem_kb > 0 && mem_kb < 1800000 )); then
+    note "Only $((mem_kb / 1024)) MB of memory is free. Building Bridge needs about 2 GB; add swap if the build fails."
+  fi
+  disk_kb=$(df -Pk "$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /)" 2>/dev/null | awk 'NR==2 {print $4}')
+  if [[ -n $disk_kb ]] && (( disk_kb < 10 * 1024 * 1024 )); then
+    note "Less than 10 GB free for Docker. The build and your mail cache need room."
+  fi
+}
+
+s2_data() {
+  step 2 "Choosing where your data lives"
+  if ! is_truenas; then
+    ok "Docker volumes on this machine (back them up encrypted: docs/operations.md)"
+    return
+  fi
+  [[ $(id -u) == 0 ]] || fail "On TrueNAS, setup runs as root." "sudo -i, then cd $root && ./bridgekeep setup"
+  [[ $root == /mnt/* ]] || fail "This checkout is on the system drive ($root), which TrueNAS upgrades can reset." "clone it onto a dataset under /mnt/, for example /mnt/tank/bridgekeep/repo"
+  if [[ -f .env ]] && grep -q '^BRIDGEKEEP_DATA=' .env; then
+    ok "TrueNAS dataset from .env: $(sed -n 's/^BRIDGEKEEP_DATA=//p' .env | tail -n1)"
+    load_env; return
+  fi
+  local guess base
+  guess=$(cd "$root/.." && pwd)
+  say "  TrueNAS: Bridgekeep keeps its login and secrets on a dataset, so snapshots"
+  say "  and encryption cover them. Use an encrypted dataset with the Generic preset."
+  if $YES || [[ ! -t 0 ]]; then base=$guess
+  else read -r -p "  Dataset folder [$guess]: " base; base=${base:-$guess}; fi
+  [[ -d $base ]] || fail "$base does not exist." "create the dataset in the TrueNAS web UI (Datasets > Add Dataset)"
+  posix_dataset "$base"
+  mkdir -p "$base/data/bridge" "$base/data/analyzer" "$base/data/portal" "$base/secrets"
+  install -d -o 10003 -g 10002 -m 2750 "$base/data/portal-config"
+  chown 10001:10001 "$base/data/bridge"; chown 10003:10003 "$base/data/portal"
+  # The portal (group 10003) reads the analyzer's health and decision log; nobody else does.
+  chown 10002:10003 "$base/data/analyzer"
+  chmod 700 "$base/data/bridge" "$base/data/portal" "$base/secrets"
+  chmod 750 "$base/data/analyzer"
+  cat > .env <<EOF
+COMPOSE_FILE=compose.yaml:deploy/truenas/compose.truenas.yaml
+BRIDGEKEEP_DATA=$base/data
+BRIDGEKEEP_SECRETS=$base/secrets
+BRIDGEKEEP_NOTIFY_DIR=$base/notify
+EOF
+  load_env
+  ok "Data in $base/data, secrets in $base/secrets (wrote .env)"
+}
+
+# pull_signed WHAT LOGF: try the signed published image (scripts/pull-image.sh).
+# Returns 0 when it's ready (verified, pinned, smoke-tested), 4 to build here.
+# A bad signature stops setup: it's never quietly replaced by a local build.
+PULL_HINT=false
+pull_signed() {
+  local what=$1 logf=$2 rc=0 why
+  $FORCE_BUILD && return 4
+  [[ -f scripts/pull-image.sh ]] || return 4
+  run_quiet "Looking for a signed $what image" "$logf" bash scripts/pull-image.sh "$what" || rc=$?
+  why=$(sed -n 's/^pull: //p' "$logf" | tail -n1)
+  case $rc in
+    0) return 0 ;;
+    4) grep -q 'not signed in' "$logf" && PULL_HINT=true
+       note "Building here instead: ${why:-no published image}"; return 4 ;;
+    *) show_log "$logf"
+       fail "${why:-The published $what image could not be checked.}" \
+         "don't use that image; a failed signature can mean it was tampered with. To build from source on this host instead: ./bridgekeep setup --build" ;;
+  esac
+}
+
+s3_build() {
+  step 3 "Getting Bridge (about a minute to download, or 5 to 15 minutes to build)"
+  # shellcheck source=/dev/null
+  local version; version=$(source bridge-version.env && echo "$BRIDGE_VERSION")
+  # The image also holds Bridgekeep's own part (entrypoint, sign-in broker):
+  # when that changed since the image was made, get or build a new one, so
+  # `git pull && ./bridgekeep setup` brings everything up to date.
+  local recipe have; recipe=$(bash scripts/build.sh --recipe)
+  have=$(docker image inspect -f '{{index .Config.Labels "bridgekeep.recipe"}}' "$IMAGE:local" 2>/dev/null || true)
+  if is_done build && docker image inspect "$IMAGE:$version" >/dev/null 2>&1 && [[ $have == "$recipe" ]]; then
+    ok "Bridge $version image already here"; return
+  fi
+  is_done build && [[ $have != "$recipe" ]] && note "Bridgekeep's part of the Bridge image changed (sign-in broker or startup script), so setup is updating it"
+  if pull_signed bridge "$log_dir/3-pull.log" \
+     && [[ $(docker image inspect -f '{{index .Config.Labels "bridgekeep.recipe"}}' "$IMAGE:local" 2>/dev/null) == "$recipe" ]]; then
+    done_mark build; done_mark smoke
+    ok "Downloaded Bridge $version: signature verified, smoke test passed"; return
+  fi
+  local logf=$log_dir/3-build.log
+  run_quiet "Building Bridge $version for $(uname -m)" "$logf" \
+    bash scripts/build.sh -t "$IMAGE:$version" -t "$IMAGE:local" \
+    || { show_log "$logf"; fail "The build failed." "check the log above; a network or memory error usually passes on a second try"; }
+  done_mark build
+  ok "Built Bridge $version"
+  if $PULL_HINT; then
+    note "Next time: run docker login ghcr.io once and Bridge downloads in a minute. Use a classic token"
+    note "with only read:packages and an expiry (https://github.com/settings/tokens/new?scopes=read:packages);"
+    note "docker keeps it in ~/.docker/config.json."
+  fi
+}
+
+s4_smoke() {
+  step 4 "Testing the image"
+  if is_done smoke && ! [[ $state_dir/done-build -nt $state_dir/done-smoke ]]; then ok "Smoke test passed"; return; fi
+  local logf=$log_dir/4-smoke.log
+  run_quiet "Smoke test" "$logf" env IMAGE="$IMAGE:local" bash tests/smoke.sh \
+    || { show_log "$logf"; fail "The smoke test failed on the new image." "see the log above"; }
+  done_mark smoke
+  ok "Smoke test passed"
+}
+
+# Sign-in and credential capture go through scripts/bridge-signin.sh, which
+# drives Bridge's CLI and answers its prompts, so nobody types CLI commands
+# or copies a password. It writes bridge_username and bridge_password into
+# the root-only secrets folder, so it runs as root.
+signin() { # capture|login
+  make_secrets_dir
+  as_root env BRIDGEKEEP_SECRETS="$SECRETS" bash scripts/bridge-signin.sh "$1"
+}
+
+# Save the credentials of an account that is already signed in, without
+# asking anything. Returns 3 when the volume has no signed-in account.
+capture_credentials() { run_quiet "Checking Bridge for an existing sign-in" "$log_dir/5-capture.log" signin capture; }
+
+sign_in() {
+  [[ -t 0 ]] || fail "Signing in needs you at the keyboard." "run ./bridgekeep setup in an interactive terminal"
+  say ""
+  say "  ${B}Sign in to Proton.${N} Have your password and your authenticator app ready."
+  say "  ${D}(A security key can't reach the container; use an authenticator-app code.)${N}"
+  say ""
+  signin login >/dev/null || fail "Sign-in didn't complete (the reason is above)." "./bridgekeep relogin"
+  ok "Signed in. Saved the password your mail apps use in $SECRETS/ (never shown)."
+}
+
+s5_signin() {
+  step 5 "Signing in to Proton"
+  # Credentials already saved: step 6 proves them with a real IMAP login, and
+  # sends you to ./bridgekeep relogin if they no longer work.
+  if [[ -n $(username) ]] && has_secret bridge_password; then
+    ok "Using the saved sign-in for $(username)"; return
+  fi
+  # Signed in earlier (for example with make init) but the credentials were
+  # never saved: pick them up without asking.
+  local rc=0
+  capture_credentials || rc=$?
+  if (( rc == 0 )) && [[ -n $(username) ]]; then
+    ok "Found an existing sign-in for $(username); saved its credentials."; return
+  fi
+  sign_in
+}
+
+wait_healthy() {
+  local start=$SECONDS deadline=$((SECONDS + ${1:-180})) h
+  while ((SECONDS < deadline)); do
+    h=$(bridge_health)
+    [[ $h == healthy ]] && return 0
+    [[ -t 1 ]] && printf '\r  Waiting for Bridge to start… %ds ' $((SECONDS - start))
+    sleep 3
+  done
+  [[ -t 1 ]] && printf '\r\e[K'
+  return 1
+}
+
+s6_start() {
+  step 6 "Starting Bridge and checking the sign-in"
+  local logf=$log_dir/6-start.log res
+  notify_init
+  local paused; paused=$(as_root cat "$(paused_file)" 2>/dev/null | tr '\n' ' ' || true)
+  if [[ -n ${paused// /} ]]; then   # setup is the "make it all work" command: it un-pauses
+    note "Paused with ./bridgekeep stop: ${paused% }. Setup starts it again."
+    as_root rm -f -- "$(paused_file)"
+  fi
+  bash scripts/fix-volumes.sh "$IMAGE:local" >"$logf" 2>&1 || true   # the broker's volumes (portal sign-in)
+  docker compose up -d bridge >>"$logf" 2>&1 || { show_log "$logf"; fail "Bridge would not start." "see the log above"; }
+  if ! wait_healthy 180; then
+    [[ -t 1 ]] && printf '\r\e[K'
+    docker compose logs --tail 30 bridge >>"$logf" 2>&1 || true
+    show_log "$logf"; fail "Bridge started but isn't answering on IMAP and SMTP after 3 minutes." "./bridgekeep logs"
+  fi
+  [[ -t 1 ]] && printf '\r\e[K'
+  export_cert || fail "Could not read Bridge's certificate." "./bridgekeep doctor"
+  local pin=0; cert_pinned || pin=$?
+  (( pin == 2 )) && fail "Couldn't read Bridge's certificate (is it running?)." "./bridgekeep logs, then ./bridgekeep setup"
+  (( pin == 0 )) || fail "Bridge is serving a different certificate from the one saved in bridge-cert.pem." "$cert_fix"
+  if ! res=$(login_check 2>/dev/null); then
+    fail "Bridge is running, but the saved sign-in doesn't work: $(json_field error <<<"$res")." "./bridgekeep relogin"
+  fi
+  ok "Signed in as $(username). Your mailbox is syncing in the background; ./bridgekeep status shows progress."
+  record_sync "$(json_field messages <<<"$res")"
+}
+
+# Earlier setups copied the example lists (billing@mybank.example, alice@gmail.com...)
+# into config/lists/curated.yaml. If the file still holds exactly those entries,
+# empty it; a file anyone has edited is left alone.
+lists_content() { sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$1" 2>/dev/null; }
+clear_example_lists() {
+  local f=config/lists/curated.yaml ex=analyzer/examples/lists/curated.yaml
+  [[ -f $f && ! -L $f && -f $ex ]] || return 0
+  [[ $(lists_content "$f") == "$(lists_content "$ex")" ]] || return 0
+  cp analyzer/examples/lists/empty.yaml "$f" && ok "Removed the example entries from config/lists/curated.yaml"
+}
+
+s7_analyzer() {
+  step 7 "AI mail analyzer (optional)"
+  clear_example_lists
+  local running=false
+  docker compose --profile analyzer ps -q analyzer 2>/dev/null | grep -q . && running=true
+  if $running && ! code_changed analyzer; then
+    docker compose --profile analyzer up -d >>"$log_dir/7-analyzer.log" 2>&1 || true   # picks up compose changes
+    ok "Analyzer running, up to date"; return
+  fi
+  if $running; then say "  This checkout has a newer analyzer. Updating it."
+  elif is_done analyzer-skip; then ok "Skipped (run ./bridgekeep setup --analyzer to add it)"; return; fi
+  if ! $running && ! $WANT_ANALYZER && ! ask N "Set up the AI mail analyzer? It only logs what it would do, and moves nothing."; then
+    done_mark analyzer-skip; ok "Skipped (run ./bridgekeep setup --analyzer to add it later)"; return
+  fi
+  rm -f "$state_dir/done-analyzer-skip"
+  local logf=$log_dir/7-analyzer.log
+  if pull_signed analyzer "$log_dir/7-pull.log"; then ok "Downloaded the analyzer: signature verified"
+  else
+    run_quiet "Building the analyzer" "$logf" docker build -t proton-analyzer:local analyzer/ \
+      || { show_log "$logf"; fail "The analyzer build failed." "see the log above"; }
+  fi
+  local vendor="" vmodel="" vargs=()
+  if ! vendor_chosen && [[ -t 0 ]] && ! $YES; then choose_vendor; fi
+  # The analyzer pins the same certificate step 6 pinned; never a fresh read.
+  mkdir -p config/portal   # mount point for the portal-config bind inside the read-only ./config
+  if [[ -f config/bridge-cert.pem ]] && ! cmp -s config/bridge-cert.pem bridge-cert.pem; then
+    printf '    Analyzer: %s\n    Bridge:   %s\n' "$(cert_fp config/bridge-cert.pem)" "$(cert_fp bridge-cert.pem)" >&2
+    fail "The analyzer has a different Bridge certificate from the one setup pinned." "if Bridge was reinstalled, delete config/bridge-cert.pem and run ./bridgekeep setup --analyzer"
+  fi
+  [[ -f config/bridge-cert.pem ]] || install -m 0644 bridge-cert.pem config/bridge-cert.pem \
+    || fail "No pinned Bridge certificate to give the analyzer." "./bridgekeep setup (step 6 saves it)"
+  BRIDGEKEEP_SECRETS=$SECRETS ANALYZER_IMAGE=proton-analyzer bash scripts/analyzer-init.sh --non-interactive >>"$logf" 2>&1 \
+    || { show_log "$logf"; fail "Analyzer setup stopped: $(sed -n 's/^analyzer-init: //p' "$logf" | tail -n1)" "./bridgekeep setup --analyzer"; }
+  if [[ -n $vendor ]]; then   # OpenAI, Gemini or local: the provider script asks for the key itself (hidden)
+    if ! as_root env BRIDGEKEEP_SECRETS="$SECRETS" ANALYZER_IMAGE=proton-analyzer \
+         bash scripts/analyzer-provider.sh "$vendor" --model "$vmodel" "${vargs[@]}"; then
+      note "The AI vendor wasn't changed, so the analyzer runs on rules and lists only."
+      note "Choose one later on the portal's Analyzer page, or: ./bridgekeep setup --analyzer"
+    fi
+  fi
+  docker compose --profile analyzer up -d >>"$logf" 2>&1 || { show_log "$logf"; fail "The analyzer would not start." "see the log above"; }
+  code_mark analyzer
+  if $running; then ok "Analyzer updated and restarted (log-only mode)"; else ok "Analyzer running in log-only mode"; fi
+}
+vendor_chosen() { local f; for f in anthropic_api_key openai_api_key gemini_api_key local_api_key; do as_root test -s "$SECRETS/$f" && return 0; done
+  [[ -f config/analyzer.yaml ]] && grep -Eq '^[[:space:]]+provider:[[:space:]]*(openai|gemini|local)' config/analyzer.yaml; }
+# Step 7's question: who reads the mail the rules can't decide. Sets vendor,
+# vmodel and vargs for after analyzer-init; Anthropic's key is saved right here.
+choose_vendor() {
+  local a key
+  say "  Who should look at mail your lists and rules can't decide?"
+  say "    1) Anthropic Claude (recommended; price built in)"
+  say "    2) OpenAI"
+  say "    3) Google Gemini"
+  say "    4) A model on your own network (Ollama, LM Studio, llama.cpp)"
+  say "    5) None: rules and lists only"
+  read -r -p "  Choose [1]: " a; a=${a:-1}
+  case $a in
+    1) say "  It spends at most \$20 a month by default (change it on the portal's Analyzer page),"
+       say "  then runs on rules only until the 1st. Use a key made just for this, with a spend limit."
+       read -r -s -p "  Anthropic API key (not shown; Enter for rules only): " key; echo
+       [[ -n $key ]] && printf '%s' "$key" | put_secret anthropic_api_key
+       key='' ;;
+    2|3) vendor=$([[ $a == 2 ]] && echo openai || echo gemini)
+       say "  Check your plan's data-use terms: free tiers and some settings let the vendor use"
+       say "  API data to improve its products. Use a paid plan with data sharing off."
+       read -r -p "  Model name, exactly as your vendor's console shows it: " vmodel
+       say "  Your plan's price, from its pricing page (US\$ per million tokens):"
+       local pin="" pout="" _
+       for _ in 1 2; do
+         read -r -p "    Input (Enter to set it later): " pin; [[ -z $pin ]] && break
+         read -r -p "    Output: " pout; [[ -n $pout ]] && break
+         note "Both prices are needed."
+       done
+       if [[ -n $pin && -n $pout ]]; then vargs=(--price-in "$pin" --price-out "$pout")
+       else note "No price yet: the model isn't used until you enter it on the portal's Analyzer page."; fi
+       [[ -n $vmodel ]] || { vendor=""; note "No model name, so no vendor: rules and lists only for now."; } ;;
+    4) vendor=local
+       say "  Mail stays on your network. Plain http is allowed only there, and is unencrypted."
+       read -r -p "  Server address (e.g. http://192.168.1.30:11434/v1): " a
+       read -r -p "  Model name, exactly as your server lists it: " vmodel
+       vargs=(--endpoint "$a")
+       [[ -n $vmodel && -n $a ]] || { vendor=""; note "Address and model are both needed: rules and lists only for now."; } ;;
+    *) ok "Rules and lists only. Add an AI later on the portal's Analyzer page." ;;
+  esac
+}
+
+# --- admin portal ------------------------------------------------------------------
+
+portal_running() { docker compose --profile portal ps -q portal 2>/dev/null | grep -q .; }
+portal_answers() { docker compose --profile portal exec -T portal python -P -m portal health >/dev/null 2>&1; }
+# Ask the portal itself: Docker's own healthcheck first runs a minute after
+# start (older engines have no start interval), so it says "starting" for a while.
+portal_health() {
+  portal_answers && { echo healthy; return; }
+  docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$(docker compose --profile portal ps -q portal 2>/dev/null)" 2>/dev/null || echo "not running"
+}
+portal_info() { docker compose --profile portal exec -T portal python -P -m portal info 2>/dev/null; }
+env_get() { [[ -f .env ]] && sed -n "s/^$1=//p" .env | tail -n1; return 0; }
+env_set() { # env_set KEY VALUE (empty VALUE removes the line). New .env files are 0600.
+  local tmp=.env.tmp.$$
+  ( umask 077; { [[ -f .env ]] && grep -v "^$1=" .env; [[ -n $2 ]] && printf '%s=%s\n' "$1" "$2"; } > "$tmp" ) || true
+  [[ -f .env ]] && chmod --reference=.env "$tmp" 2>/dev/null
+  mv "$tmp" .env
+}
+portal_wait() {
+  local start=$SECONDS
+  while ((SECONDS < start + 90)); do
+    portal_answers && { [[ -t 1 ]] && printf '\r\e[K'; return 0; }
+    [[ -t 1 ]] && printf '\r  Waiting for the portal… %ds ' $((SECONDS - start))
+    sleep 2
+  done
+  [[ -t 1 ]] && printf '\r\e[K'; return 1
+}
+portal_up() { # recreate with the current .env, then wait
+  local logf=$log_dir/8-portal.log
+  docker compose --profile portal up -d portal >>"$logf" 2>&1 || { show_log "$logf"; fail "The portal would not start." "see the log above"; }
+  if ! portal_wait; then
+    docker compose --profile portal logs --tail 30 portal >>"$logf" 2>&1 || true
+    show_log "$logf"; fail "The portal started but isn't answering." "docker compose --profile portal logs portal"
+  fi
+}
+# Where to open it, and (once, to a terminal only) a claim code.
+portal_show() {
+  local info u fp
+  info=$(portal_info) || { note "The portal isn't answering. ./bridgekeep doctor"; return 1; }
+  fp=$(sed -n 's/^fingerprint=//p' <<<"$info")
+  say "  Open the portal:"
+  while read -r u; do [[ -n $u ]] && say "    ${B}$u${N}"; done < <(sed -n 's/^url=//p' <<<"$info")
+  if [[ -n $fp ]]; then
+    say "  Your browser warns about the certificate once. Continue only if it shows this"
+    say "  fingerprint (SHA-256); that's how you know it's really this computer:"
+    # 32 pairs: four lines of eight, easy to compare by eye.
+    sed 's/:/ /g' <<<"$fp" | xargs -n 8 | sed 's/^/    /'
+    say "  To skip the warning from now on, install $(sed -n 's/^url=//p' <<<"$info" | tail -n1)/portal.crt as trusted (portal/README.md)."
+  else
+    say "  ${D}Only this computer can open it. ./bridgekeep portal network on opens it to your home network.${N}"
+  fi
+  if grep -qx 'claimed=no' <<<"$info"; then
+    if [[ -t 1 ]]; then
+      local code
+      code=$(docker compose --profile portal exec -T portal python -P -m portal code --plain 2>/dev/null)
+      [[ -n $code ]] && say "  Then enter this one-time code: ${B}$code${N}" \
+        && say "  ${D}It works once and expires in an hour. A new one: ./bridgekeep portal code${N}"
+    else
+      say "  Get the one-time code to claim it: ./bridgekeep portal code"
+    fi
+  fi
+}
+# Host TCP ports in use: anything listening here, plus every port Docker
+# publishes (also for stopped-but-defined containers that will come back).
+ports_in_use() {
+  { if command -v ss >/dev/null 2>&1; then ss -ltnH 2>/dev/null | awk '{print $4}' | sed 's/.*://'
+    else local hex
+      while read -r hex; do printf '%d\n' "0x$hex"; done < <(awk 'NR > 1 && $4 == "0A" {split($2, a, ":"); print a[2]}' /proc/net/tcp /proc/net/tcp6 2>/dev/null); fi
+    docker ps -a --format '{{.Ports}}' 2>/dev/null | tr ',' '\n' | sed -n 's/.*:\([0-9]*\)->.*/\1/p'
+  } | sort -un
+}
+# PORTAL_PORT: kept once chosen, so reruns and updates never move it.
+portal_port() {
+  local p used
+  p=$(env_get PORTAL_PORT)
+  if [[ -n $p ]]; then printf '%s' "$p"; return; fi
+  used=$(ports_in_use)
+  for ((p = 8443; p < 8543; p++)); do
+    grep -qx "$p" <<<"$used" || break
+  done
+  env_set PORTAL_PORT "$p"
+  printf '%s' "$p"
+}
+
+# Docker before 28 ignores the portal network's no-internet setting and lets
+# 127.0.0.1-published ports leak to the LAN. Warn, don't refuse (security lead).
+docker_old_warning() {
+  local v
+  v=$(docker version -f '{{.Server.Version}}' 2>/dev/null) || return 0
+  (( ${v%%.*} >= 28 )) 2>/dev/null && return 0
+  note "Docker $v is older than 28: the portal can reach the internet, and in local mode other"
+  note "devices on your network may reach it too. Update Docker Engine (docs/linux-host.md)."
+}
+
+# The portal's writable settings folder (portal.yaml, PAUSE), outside the
+# checkout. Root makes only the folder itself: never -R and never through a
+# link, because 10003 controls what is inside (security review).
+portal_config_dir() {
+  local base; base=$(env_get BRIDGEKEEP_DATA)
+  if [[ -n $base ]]; then printf '%s/portal-config' "$base"
+  else printf '%s' "$(env_get BRIDGEKEEP_PORTAL_CONFIG)"; fi
+}
+make_portal_config() {
+  local d; d=$(portal_config_dir); d=${d:-/var/lib/bridgekeep/portal-config}
+  if as_root test -L "$d"; then fail "$d is a symbolic link." "remove it, then run ./bridgekeep setup --portal"; fi
+  as_root install -d -m 0755 -o 0 -g 0 "$(dirname "$d")"
+  as_root install -d -o 10003 -g 10002 -m 2750 "$d"
+}
+
+lan_address() { # the address this host uses to reach the network
+  local ip
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)
+  [[ -n $ip ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  printf '%s' "$ip"
+}
+portal_network_on() {
+  local info ip hosts name a
+  if portal_running && info=$(portal_info) && grep -qx 'claimed=yes' <<<"$info" && grep -qx 'authenticator=off' <<<"$info"; then
+    note "Your portal account has a password but no authenticator app. With network access on,"
+    note "anyone on your network who learns that password can sign in."
+    if ask Y "Add the authenticator first? (Portal > Settings > Authenticator, then run this again)"; then
+      say "  Network access is still off."; return 1
+    fi
+  fi
+  docker_old_warning
+  ip=$(lan_address)
+  if [[ -t 0 ]] && ! $YES; then
+    read -r -p "  This computer's address on your network [$ip]: " a; ip=${a:-$ip}
+  fi
+  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ && $ip != 0.0.0.0 && $ip != 127.* ]] \
+    || fail "'$ip' isn't one of this computer's network addresses." "ip -4 addr, then ./bridgekeep portal network on"
+  name=$(hostname -s 2>/dev/null || hostname)
+  hosts=$ip
+  [[ $name =~ ^[A-Za-z0-9-]+$ ]] && hosts="$name.local,$name,$ip"
+  env_set PORTAL_ADDRESS "$ip"
+  env_set PORTAL_HOSTS "$hosts"
+  ok "Network access on: HTTPS on $ip, opened as ${hosts//,/ or }"
+}
+portal_network_off() {
+  env_set PORTAL_ADDRESS ""; env_set PORTAL_HOSTS ""
+  ok "Network access off: only this computer can open the portal"
+}
+
+s8_portal() {
+  step 8 "Admin website (portal)"
+  local running=false
+  portal_running && running=true
+  if $running && ! code_changed portal; then
+    portal_up; ok "Portal running, up to date"; portal_show || true; return
+  fi
+  if $running; then say "  This checkout has a newer portal. Updating it (about a minute)."
+  elif is_done portal-skip && ! $WANT_PORTAL; then ok "Skipped (run ./bridgekeep setup --portal to add it)"; return; fi
+  if ! $running && ! $WANT_PORTAL && ! ask Y "Set up the admin website? It shows Bridge's status in your browser; you'll choose an admin password on first visit."; then
+    done_mark portal-skip; ok "Skipped (run ./bridgekeep setup --portal to add it later)"; return
+  fi
+  rm -f "$state_dir/done-portal-skip"
+  local logf=$log_dir/8-portal.log base
+  base=$(env_get BRIDGEKEEP_DATA)
+  if [[ -n $base ]]; then   # TrueNAS dataset from before the portal existed
+    mkdir -p "$base/portal" && chown 10003:10003 "$base/portal" && chmod 700 "$base/portal"
+    chgrp 10003 "$base/analyzer" 2>/dev/null && chmod 750 "$base/analyzer" 2>/dev/null || true
+  fi
+  make_portal_config
+  as_root bash scripts/secret-requests.sh init
+  local port
+  port=$(portal_port)
+  docker_old_warning
+  [[ $port == 8443 ]] || note "Port 8443 is already in use here, so the portal uses $port (saved in .env as PORTAL_PORT)."
+  local built_from
+  built_from=$(bash scripts/versions.sh 2>/dev/null | sed -n 's/^bridgekeep_commit=\([0-9a-f]*\)$/\1/p')
+  run_quiet "Building the portal" "$logf" bash scripts/docker-build.sh -t bridgekeep-portal:local \
+    --build-arg BRIDGEKEEP_COMMIT="$built_from" portal/ \
+    || { show_log "$logf"; fail "The portal build failed." "see the log above"; }
+  # Network access is a separate yes: --yes alone keeps it on this computer only.
+  # In a container (Proxmox LXC), "this computer" is only the container, so yes is the default.
+  if ! $running && [[ -z $(env_get PORTAL_ADDRESS) ]] && ! $YES && [[ -t 0 ]]; then
+    local lan=N
+    if in_lxc; then
+      lan=Y; say "  Bridgekeep is in a container: without network access, nothing else (not even its host) can open the portal."
+    fi
+    if ask "$lan" "Open it from your other devices on your home network too (HTTPS, with its own certificate)?"; then
+      portal_network_on || true
+    fi
+  fi
+  portal_up
+  code_mark portal
+  if $running; then ok "Portal updated and restarted"; else ok "Portal running"; fi
+  portal_show || true
+}
+
+cmd_portal() {
+  load_env
+  case ${1:-info} in
+    info)  portal_running || { say "The portal isn't set up. Run ./bridgekeep setup --portal"; exit 1; }; portal_show ;;
+    code)  portal_running || { say "The portal isn't running. Run ./bridgekeep setup --portal"; exit 1; }
+           [[ -t 1 ]] || { say "portal code only prints to a terminal, so the code can't end up in a log."; exit 1; }
+           docker compose --profile portal exec -T portal python -P -m portal code ;;
+    reset-admin)
+           portal_running || { say "The portal isn't running."; exit 1; }
+           ask N "Forget the portal's admin password and authenticator, and sign everyone out?" || exit 0
+           [[ -t 1 ]] || { docker compose --profile portal exec -T portal python -P -m portal reset-admin --yes >/dev/null; say "Done. Get a claim code: ./bridgekeep portal code"; exit 0; }
+           docker compose --profile portal exec -T portal python -P -m portal reset-admin --yes ;;
+    network)
+           case ${2:-} in
+             on)  portal_network_on || exit 1 ;;
+             off) portal_network_off ;;
+             *)   say "usage: ./bridgekeep portal network on|off"; exit 2 ;;
+           esac
+           if portal_running; then portal_up; portal_show; fi ;;
+    *) say "usage: ./bridgekeep portal [info|code|reset-admin|network on|network off]"; exit 2 ;;
+  esac
+}
+
+# The nightly job runs as root from this checkout, so only root may be able
+# to change it: otherwise any user who can write here could run code as root.
+checkout_safe() {
+  local d=$root bad
+  # Everything the job reads or runs (scripts, Dockerfile, compose files, .env,
+  # bridge-version.env, which is sourced as bash) must be root's alone.
+  bad=$(find "$root" -path "$root/.git" -prune -o \( ! -user 0 -o -perm /022 \) -print 2>/dev/null | head -n 5)
+  # So must every parent folder, or someone could swap in another checkout.
+  while [[ $d != / ]]; do
+    d=$(dirname "$d")
+    [[ $(stat -c %u "$d") == 0 ]] && (( (8#$(stat -c %a "$d") & 8#022) == 0 || (8#$(stat -c %a "$d") & 8#1000) != 0 )) \
+      || bad+=$'\n'"$d"
+  done
+  [[ -z ${bad//$'\n'/} ]] && return 0
+  printf '    not root-only: %s\n' $bad >&2
+  return 1
+}
+
+s9_updates() {
+  step 9 "Scheduling nightly update checks"
+  local logfile=/var/log/bridgekeep/auto-update.log   # root-only folder, not the checkout
+  local cmd="cd '$root' && bash scripts/auto-update.sh >> '$logfile' 2>&1; tail -n 5000 '$logfile' > '$logfile.tmp' && mv '$logfile.tmp' '$logfile'"
+  local min=$((RANDOM % 60)) hour=$((3 + RANDOM % 2))
+  if update_scheduled; then ok "Already scheduled ($(update_when))"; s9_watch; return; fi
+  if ! ask Y "Check every night, build and test new Bridge releases, and tell you when one is ready to install?"; then
+    note "Not scheduled. Run ./bridgekeep update yourself, or ./bridgekeep setup to schedule it."; s9_watch; return
+  fi
+  as_root install -d -m 0700 -o 0 -g 0 /var/log/bridgekeep
+  checkout_safe || fail "The nightly job runs as root from this folder, so only root may be able to change it." \
+    "sudo chown -R root:root '$root' && sudo chmod -R go-w '$root'"
+  if is_truenas; then
+    local job
+    job=$(CMD=$cmd MIN=$min HOUR=$hour python3 -I -c 'import json, os; print(json.dumps({"user": "root", "command": os.environ["CMD"], "description": "Bridgekeep auto-update", "schedule": {"minute": os.environ["MIN"], "hour": os.environ["HOUR"], "dom": "*", "month": "*", "dow": "*"}, "stdout": True, "stderr": False, "enabled": True}))')
+    midclt call cronjob.create "$job" >/dev/null \
+      || fail "Could not add the TrueNAS cron job." "System > Advanced Settings > Cron Jobs > Add, command: $cmd"
+  elif command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    # The command runs from a root-owned script file, so no path is ever
+    # pasted into a unit line (no quoting or %-specifier surprises).
+    as_root install -d -m 0755 /usr/local/lib/bridgekeep
+    printf '#!/bin/bash\n%s\n' "$cmd" | as_root tee /usr/local/lib/bridgekeep/nightly-update >/dev/null
+    as_root chmod 0755 /usr/local/lib/bridgekeep/nightly-update
+    as_root tee /etc/systemd/system/bridgekeep-update.service >/dev/null <<'UNIT'
+[Unit]
+Description=Bridgekeep: build and test new Proton Mail Bridge releases (no deploy)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/bridgekeep/nightly-update
+UNIT
+    printf '[Unit]\nDescription=Bridgekeep nightly update check\n[Timer]\nOnCalendar=*-*-* %02d:%02d:00\nPersistent=true\n[Install]\nWantedBy=timers.target\n' "$hour" "$min" \
+      | as_root tee /etc/systemd/system/bridgekeep-update.timer >/dev/null
+    as_root systemctl daemon-reload && as_root systemctl enable --now bridgekeep-update.timer >/dev/null 2>&1 \
+      || fail "Could not enable the update timer." "sudo systemctl enable --now bridgekeep-update.timer"
+  else
+    printf '%d %d * * * root %s\n' "$min" "$hour" "$cmd" | as_root tee /etc/cron.d/bridgekeep >/dev/null \
+      || fail "Could not write /etc/cron.d/bridgekeep." "run setup as root"
+  fi
+  ok "Every night at $(printf '%02d:%02d' "$hour" "$min") ($(date +%Z)). New releases are built and tested; ./bridgekeep status says when one is ready, and ./bridgekeep deploy-update installs it."
+  s9_watch
+}
+s9_watch() {
+  install_watch
+  watch_round >/dev/null 2>&1 || true   # fill the Status page now
+  s9_alerts
+}
+# --- Discord alerts (scripts/notify.sh; the webhook stays on the host) -------------
+# NFSv4-ACL datasets (the SMB preset) ignore chown/chmod the way setup needs.
+posix_dataset() {
+  local name t   # not on ZFS, or zfs can't say: nothing to refuse here
+  read -r name t < <(zfs list -H -o name,acltype -- "$1" 2>/dev/null || true)
+  [[ ${t,,} != nfsv4 ]] || fail "Dataset ${name:-$1} uses NFSv4 permissions (the SMB preset), which Bridgekeep can't lock down." \
+    "create a dataset with the Generic preset (Datasets > Add Dataset), then ./bridgekeep setup"
+}
+notify_init() {
+  local base; base=$(env_get BRIDGEKEEP_DATA)
+  # TrueNAS hosts set up before alerts existed: keep the folders on the dataset.
+  if [[ -n $base && -z $(env_get BRIDGEKEEP_NOTIFY_DIR) ]]; then env_set BRIDGEKEEP_NOTIFY_DIR "$(dirname "$base")/notify"; fi
+  if [[ -n $base ]]; then   # the container users own spools inside it, so the dataset itself must be root's alone
+    local top; top=$(dirname "$base")
+    posix_dataset "$top"
+    local acl=""   # extra POSIX ACL entries can grant write access the mode bits don't show
+    command -v getfacl >/dev/null 2>&1 && acl=$(getfacl -cp "$top" 2>/dev/null | grep -Ev '^(user::|group::|other::|$)' || true)
+    [[ $(stat -c %u "$top") == 0 && -z $acl ]] && (( (8#$(stat -c %a "$top") & 8#022) == 0 )) \
+      || fail "$top must belong to root, with no extra permissions for other users (the alert folders live in it)." \
+              "chown root:root '$top' && chmod 755 '$top' && setfacl -b '$top', then ./bridgekeep setup. In the TrueNAS web UI: Datasets > Edit Permissions, owner root, group root, Strip ACL. Changing it back there later stops alerts."
+  fi
+  as_root env BRIDGEKEEP_SECRETS="$SECRETS" bash scripts/notify.sh init >>"$log_dir/notify.log" 2>&1 \
+    || fail "Could not create the alert folders." "see $log_dir/notify.log, then ./bridgekeep setup"
+}
+alerts_state() { as_root env BRIDGEKEEP_SECRETS="$SECRETS" bash scripts/notify.sh status 2>/dev/null || echo off; }
+s9_alerts() {
+  if [[ $(alerts_state) == on* ]]; then ok "Alerts go to Discord"; return; fi
+  if is_done alerts-skip || $YES || [[ ! -t 0 ]]; then
+    ok "Alerts off (./bridgekeep alerts on sends them to Discord)"; return
+  fi
+  say "  Bridgekeep can message a Discord channel when something needs you: Bridge signed out,"
+  say "  an update ready to install, the disk nearly full, the analyzer's budget used up."
+  if ! ask Y "Set up Discord alerts? You'll paste a channel webhook URL (Enter skips)."; then
+    done_mark alerts-skip; ok "Alerts off (./bridgekeep alerts on sends them to Discord)"; return
+  fi
+  say "  In Discord: Server Settings > Integrations > Webhooks > New Webhook > Copy Webhook URL."
+  if as_root env BRIDGEKEEP_SECRETS="$SECRETS" bash scripts/notify.sh configure && [[ $(alerts_state) == on* ]]; then
+    ok "Alerts go to Discord (a test message was sent)"
+  else
+    done_mark alerts-skip; note "Alerts off for now. Try again any time: ./bridgekeep alerts on"
+  fi
+}
+cmd_alerts() {
+  load_env
+  local n=(as_root env BRIDGEKEEP_SECRETS="$SECRETS" bash scripts/notify.sh)
+  case ${1:-} in
+    on)   notify_init; "${n[@]}" configure && [[ $(alerts_state) == on* ]] || exit 1
+          rm -f -- "$state_dir/done-alerts-skip" ;;
+    off)  "${n[@]}" remove ;;
+    test) "${n[@]}" test ;;
+    "")   say "Alerts: $(alerts_state)"
+          if [[ $(alerts_state) == on* ]]; then say "  Send a test: ./bridgekeep alerts test. Turn off: ./bridgekeep alerts off"
+          else say "  Turn on (paste a Discord webhook URL): ./bridgekeep alerts on"; fi ;;
+    *)    say "usage: ./bridgekeep alerts [on|off|test]"; exit 2 ;;
+  esac
+}
+update_scheduled() {
+  if is_truenas; then midclt call cronjob.query 2>/dev/null | grep -q 'Bridgekeep auto-update'
+  elif [[ -f /etc/systemd/system/bridgekeep-update.timer ]]; then systemctl is-enabled bridgekeep-update.timer >/dev/null 2>&1
+  else [[ -f /etc/cron.d/bridgekeep ]]; fi
+}
+update_when() {
+  if [[ -f /etc/systemd/system/bridgekeep-update.timer ]]; then sed -n 's/^OnCalendar=\*-\*-\* \(..:..\).*/nightly at \1/p' /etc/systemd/system/bridgekeep-update.timer
+  elif [[ -f /etc/cron.d/bridgekeep ]]; then awk '{printf "nightly at %02d:%02d", $2, $1}' /etc/cron.d/bridgekeep
+  else echo "TrueNAS cron job"; fi
+}
+
+# The 5-minute health check (scripts/health-watch.sh): Discord alerts, and the
+# files the portal's Status page reads. Root runs it from this checkout, so
+# the wrapper checks on every run that only root can change the checkout,
+# and skips the round (logging why) if not.
+watch_installed() {
+  if is_truenas; then midclt call cronjob.query 2>/dev/null | grep -q 'Bridgekeep health watch'
+  elif [[ -f /etc/systemd/system/bridgekeep-watch.timer ]]; then systemctl is-enabled bridgekeep-watch.timer >/dev/null 2>&1
+  else [[ -f /etc/cron.d/bridgekeep-watch ]]; fi
+}
+install_watch() {
+  local logfile=/var/log/bridgekeep/health-watch.log wrapper=/usr/local/lib/bridgekeep/health-watch script
+  if watch_installed && { is_truenas || [[ -f $wrapper ]]; }; then ok "Health check already runs every 5 minutes"; return; fi
+  as_root install -d -m 0700 -o 0 -g 0 /var/log/bridgekeep
+  checkout_safe || fail "The health check runs as root from this folder, so only root may be able to change it." \
+    "sudo chown -R root:root '$root' && sudo chmod -R go-w '$root'"
+  # Every path goes through %q, so any folder name is safe.
+  script=$(
+    printf '#!/bin/bash\n# Bridgekeep health check, every 5 minutes. Written by ./bridgekeep setup.\n'
+    printf 'root=%q log=%q\n' "$root" "$logfile"
+    declare -f checkout_safe
+    printf 'exec 9>/run/bridgekeep-watch.lock; flock -n 9 || exit 0   # previous round still running\n'
+    # shellcheck disable=SC2016  # expands when the wrapper runs
+    printf '%s\n' 'if ! checkout_safe 2>>"$log"; then echo "$(date -u +%FT%TZ) [watch] skipped: $root is not root-only" >>"$log"; exit 1; fi' \
+      'cd "$root" || exit 1' \
+      'bash scripts/health-watch.sh >>"$log" 2>&1' \
+      'tail -n 2000 "$log" >"$log.tmp" && mv -f "$log.tmp" "$log"'
+  )
+  if is_truenas; then
+    # SCALE keeps /usr read-only and resets it on upgrades, so the wrapper
+    # lives in the cron job itself (TrueNAS's own config, root-only, kept
+    # across upgrades), base64 so no quoting can go wrong.
+    local job b64
+    b64=$(printf '%s\n' "$script" | base64 -w0)
+    job=$(CMD="echo $b64 | base64 -d | bash" python3 -I -c 'import json, os; print(json.dumps({"user": "root", "command": os.environ["CMD"], "description": "Bridgekeep health watch", "schedule": {"minute": "*/5", "hour": "*", "dom": "*", "month": "*", "dow": "*"}, "stdout": False, "stderr": False, "enabled": True}))')
+    watch_installed || midclt call cronjob.create "$job" >/dev/null \
+      || fail "Could not add the TrueNAS cron job." "check that the middleware is running (midclt call cronjob.query), then run ./bridgekeep setup again"
+    ok "Health check every 5 minutes (log: $logfile)"
+    return
+  fi
+  as_root install -d -m 0755 /usr/local/lib/bridgekeep
+  printf '%s\n' "$script" | as_root tee "$wrapper" >/dev/null
+  as_root chmod 0755 "$wrapper"
+  if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+    as_root tee /etc/systemd/system/bridgekeep-watch.service >/dev/null <<'UNIT'
+[Unit]
+Description=Bridgekeep: health check, alerts and portal status (changes nothing)
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/bridgekeep/health-watch
+UNIT
+    printf '[Unit]\nDescription=Bridgekeep health check every 5 minutes\n[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n[Install]\nWantedBy=timers.target\n' \
+      | as_root tee /etc/systemd/system/bridgekeep-watch.timer >/dev/null
+    as_root systemctl daemon-reload && as_root systemctl enable --now bridgekeep-watch.timer >/dev/null 2>&1 \
+      || fail "Could not enable the health check timer." "sudo systemctl enable --now bridgekeep-watch.timer"
+  else
+    printf '*/5 * * * * root %s\n' "$wrapper" | as_root tee /etc/cron.d/bridgekeep-watch >/dev/null \
+      || fail "Could not write /etc/cron.d/bridgekeep-watch." "run setup as root"
+  fi
+  ok "Health check every 5 minutes (log: $logfile)"
+}
+watch_round() { # one round now, exactly as the schedule runs it
+  if is_truenas; then
+    local id; id=$(midclt call cronjob.query '[["description","=","Bridgekeep health watch"]]' 2>/dev/null | python3 -I -c 'import json, sys; j = json.load(sys.stdin); print(j[0]["id"] if j else "")')
+    [[ -n $id ]] && midclt call cronjob.run "$id" >/dev/null
+  else as_root /usr/local/lib/bridgekeep/health-watch; fi
+}
+# stop/start: pause Bridge (or the whole stack), e.g. while its first sync
+# eats bandwidth. state/paused tells the health check not to alert for it.
+paused_file() { local d=${BRIDGEKEEP_NOTIFY_DIR:-$(env_get BRIDGEKEEP_NOTIFY_DIR)}; printf '%s/state/paused' "${d:-/var/lib/bridgekeep/notify}"; }
+is_paused() { as_root grep -qx -- "$1" "$(paused_file)" 2>/dev/null; }
+cmd_stop_start() { # stop|start [bridge|all]
+  load_env
+  local what=${2:-all} f svcs
+  f=$(paused_file)
+  case $what in
+    bridge) svcs=(bridge) ;;
+    all) mapfile -t svcs < <(docker compose --profile analyzer --profile portal ps -a --services 2>/dev/null) ;;
+    *) say "usage: ./bridgekeep $1 [bridge|all]"; exit 2 ;;
+  esac
+  (( ${#svcs[@]} )) || { say "Nothing is set up here yet. Run ./bridgekeep setup."; exit 1; }
+  as_root install -d -m 0700 "$(dirname "$f")"
+  if [[ $1 == stop ]]; then
+    { as_root cat "$f" 2>/dev/null || true; printf '%s\n' "${svcs[@]}"; } | sort -u | as_root tee "$f.new" >/dev/null
+    as_root mv -f -- "$f.new" "$f"
+    docker compose --profile analyzer --profile portal stop "${svcs[@]}" >/dev/null 2>&1 \
+      || fail "Could not stop ${svcs[*]}." "sudo docker compose --profile analyzer --profile portal stop ${svcs[*]}"
+    ok "Stopped: ${svcs[*]}. It stays stopped, even after a reboot, until ./bridgekeep start${2:+ $2}."
+    [[ $what == all ]] && note "The admin portal is stopped too, so its website won't open until then."
+    [[ $what == bridge ]] && note "The analyzer can't read mail while Bridge is stopped."
+  else
+    docker compose --profile analyzer --profile portal start "${svcs[@]}" >/dev/null 2>&1 \
+      || fail "Could not start ${svcs[*]}." "sudo docker compose --profile analyzer --profile portal start ${svcs[*]}"
+    if [[ $what == all ]]; then as_root rm -f -- "$f"
+    elif as_root test -f "$f"; then as_root sed -i '/^bridge$/d' "$f"; fi
+    ok "Started: ${svcs[*]}. Bridge picks up its sync where it stopped."
+  fi
+}
+cmd_watch() {
+  load_env
+  install_watch
+  say "Running one round now…"
+  if ! watch_round; then
+    note "The round was skipped or failed; see: sudo tail -n 20 /var/log/bridgekeep/health-watch.log"
+  elif portal_running; then ok "Done. The portal's Status page shows Bridge and Storage now."
+  else ok "Done. Alerts and status files are up to date."; fi
+}
+
+record_sync() { [[ ${1:-} =~ ^[0-9]+$ ]] && printf '%s %s\n' "$(date +%s)" "$1" >> "$state_dir/sync"; return 0; }
+
+s10_summary() {
+  step 10 "Final check"
+  local res pass=true
+  row() { printf '  %-22s %s\n' "$1" "$2"; }
+  [[ $(bridge_health) == healthy ]] && row "Bridge" "${G}PASS${N} healthy" || { row "Bridge" "${R}FAIL${N} $(bridge_health)"; pass=false; }
+  if res=$(login_check 2>/dev/null); then row "Sign-in (real IMAP)" "${G}PASS${N} $(username)"
+  else row "Sign-in (real IMAP)" "${R}FAIL${N} $(json_field error <<<"$res")"; pass=false; fi
+  [[ -f bridge-cert.pem ]] && row "Certificate" "${G}PASS${N} bridge-cert.pem" || { row "Certificate" "${R}FAIL${N}"; pass=false; }
+  update_scheduled && row "Daily updates" "${G}PASS${N} $(update_when)" || row "Daily updates" "${Y}not scheduled${N}"
+  if watch_installed; then row "Health check" "${G}PASS${N} every 5 minutes"
+  else row "Health check" "${R}FAIL${N} not scheduled: ./bridgekeep watch"; pass=false; fi
+  if docker compose --profile analyzer ps -q analyzer 2>/dev/null | grep -q .; then row "Analyzer" "${G}PASS${N} running, log-only"
+  else row "Analyzer" "not set up"; fi
+  if portal_running; then
+    [[ $(portal_health) == healthy ]] && row "Portal" "${G}PASS${N} $(portal_info | sed -n 's/^url=//p' | head -n1)"       || { row "Portal" "${R}FAIL${N} $(portal_health)"; pass=false; }
+  else row "Portal" "not set up"; fi
+  row "Backups" "${Y}your job${N}: docs/operations.md#backup-and-restore"
+  say ""
+  if $pass; then
+    say "${G}${B}Bridgekeep is running.${N} Mail apps and containers on the ${B}$NETWORK${N} network"
+    say "connect to ${B}bridge:1143${N} (IMAP, STARTTLS). Get the login with ${B}./bridgekeep credentials${N}."
+    say ""
+    say "Day to day:  ./bridgekeep status   ./bridgekeep logs   ./bridgekeep doctor"
+  else
+    say "${R}${B}Something isn't right.${N} Run ${B}./bridgekeep doctor${N} for the fix."
+    exit 1
+  fi
+}
+
+cmd_setup() {
+  WANT_ANALYZER=false WANT_PORTAL=false
+  for a in "$@"; do
+    case $a in
+      --yes|-y) YES=true ;;
+      --analyzer) WANT_ANALYZER=true; rm -f "$state_dir/done-analyzer-skip" ;;
+      --build) FORCE_BUILD=true; rm -f -- "$state_dir/done-build" ;;
+      --portal) WANT_PORTAL=true; rm -f "$state_dir/done-portal-skip" ;;
+      *) say "unknown option '$a' (use --yes, --analyzer, --portal or --build)"; exit 2 ;;
+    esac
+  done
+  load_env
+  say "${B}Bridgekeep setup${N}  ${D}(logs in $log_dir/; safe to stop and run again)${N}"
+  s1_host; s2_data; s3_build; s4_smoke; s5_signin; s6_start; s7_analyzer; s8_portal; s9_updates; s10_summary
+}
+
+# --- day-two commands ------------------------------------------------------------
+
+cmd_status() {
+  load_env
+  local h res n first
+  status_version
+  h=$(bridge_health)
+  if is_paused bridge && [[ $h != healthy ]]; then
+    printf '%-14s %s\n' "Bridge" "${Y}paused${N} on purpose (./bridgekeep start bridge starts it again)"
+  else printf '%-14s %s\n' "Bridge" "$h"; fi
+  if is_paused bridge && [[ $h != healthy ]]; then
+    printf '%-14s %s\n' "Signed in" "not checked while Bridge is paused"
+  elif [[ $h == healthy ]] && res=$(login_check 2>/dev/null); then
+    printf '%-14s %s\n' "Signed in" "$(username)"
+    n=$(json_field messages <<<"$res"); record_sync "$n"
+    if [[ -n $n ]]; then
+      read -r first < <(tail -n 2 "$state_dir/sync" | head -n1 | awk '{print $2}')
+      if [[ -n $first && $first != "$n" ]]; then
+        printf '%-14s %s messages so far, still growing (was %s at the last check)\n' "Mail sync" "$n" "$first"
+      else
+        printf '%-14s %s messages, no change since the last check\n' "Mail sync" "$n"
+      fi
+    fi
+  elif [[ $h != healthy ]]; then
+    printf '%-14s %s\n' "Signed in" "can't check until Bridge is healthy (it takes up to a minute after a start)"
+  else
+    printf '%-14s %s\n' "Signed in" "no: $(json_field error <<<"${res:-}") (./bridgekeep doctor)"
+  fi
+  printf '%-14s %s\n' "Updates" "$(update_scheduled && update_when || echo 'not scheduled')"
+  if [[ -f $state_dir/update-waiting ]]; then
+    printf '%-14s %s\n' "Update ready" "Bridge $(sed -n 's/^version=//p' "$state_dir/update-waiting"), built and tested. Install it: ./bridgekeep deploy-update"
+  fi
+  as_root test -f /var/log/bridgekeep/auto-update.log && printf '%-14s %s\n' "Last update" "$(as_root tail -n1 /var/log/bridgekeep/auto-update.log)"
+  if docker compose --profile analyzer ps -q analyzer 2>/dev/null | grep -q .; then
+    printf '%-14s %s\n' "Analyzer" "running, log-only"
+    local hj m spend budget next
+    hj=$(docker compose --profile analyzer exec -T analyzer cat /data/health.json 2>/dev/null | tr -d '\n' || true)
+    m=$(json_field model <<<"$hj"); spend=$(json_field spend_month_usd <<<"$hj"); budget=$(json_field budget_usd <<<"$hj")
+    next=$(date -u -d "$(date -u +%Y-%m-01) +1 month" '+%b %-d' 2>/dev/null || echo 'the 1st')
+    local who; who=$(json_field model_name <<<"$hj" | tr -cd '[:alnum:]._:/-'); [[ -n $who ]] || who=AI
+    local via; via=$(json_field provider <<<"$hj" | tr -cd '[:alnum:]')
+    [[ -n $via ]] && who="$who ($via)"
+    case $m in
+      on) printf '%-14s %s: $%.2f of $%s this month\n' "Model" "$who" "${spend:-0}" "${budget%.0}" ;;
+      no_price) printf '%-14s %s\n' "Model" "$who isn't used yet: enter your plan's price on the portal's Analyzer page" ;;
+      off) printf '%-14s %s\n' "Model" "off (rules and lists only)" ;;
+      budget_cap) printf '%-14s Budget reached ($%s): rules only until %s\n' "Model" "${budget%.0}" "$next" ;;
+      rate_cap_*) printf '%-14s %s\n' "Model" "paused by the hourly or daily limit; rules only for now" ;;
+      no_key) printf '%-14s %s\n' "Model" "No API key: rules and lists only. Add a key in the portal (Analyzer page)" ;;
+    esac
+    status_backfill "$(json_field skipped_pre_go_live <<<"$hj")"
+    status_settings
+  else printf '%-14s %s\n' "Analyzer" "not set up"; fi
+  status_portal
+  local paused; paused=$(as_root cat "$(paused_file)" 2>/dev/null | tr -cd '[:alnum:]_\n-' | tr '\n' ' ' || true)
+  if [[ -n ${paused// /} ]]; then
+    printf '%-14s %s\n' "Paused" "${Y}${paused% }${N}: no alerts for these while they're stopped (./bridgekeep start)"
+  fi
+  if watch_installed; then printf '%-14s %s\n' "Health check" "every 5 minutes"
+  else printf '%-14s %s\n' "Health check" "not installed (./bridgekeep watch)"; fi
+  local al; al=$(alerts_state)
+  if [[ $al == on* ]]; then printf '%-14s %s\n' "Alerts" "$al"
+  else printf '%-14s %s\n' "Alerts" "off (./bridgekeep alerts on sends them to Discord)"; fi
+  status_storage
+}
+
+# status_version: Bridgekeep (VERSION and commit) and the running Bridge.
+status_version() {
+  local k v; local -A ver=()
+  while IFS='=' read -r k v; do [[ -n $k ]] && ver[$k]=$v; done < <(bash scripts/versions.sh 2>/dev/null)
+  local line="Bridgekeep ${ver[bridgekeep_version]:-unknown}"
+  [[ -n ${ver[bridgekeep_commit]:-} ]] && line+=" (${ver[bridgekeep_commit]})"
+  [[ -n ${ver[bridge_version]:-} ]] && line+=", Bridge ${ver[bridge_version]}"
+  printf '%-14s %s\n' "Version" "$line"
+  local s ready=()
+  for s in portal analyzer; do
+    [[ ${ver[${s}_built]:-none} != none && ${ver[${s}_checkout]:-none} != none \
+       && ${ver[${s}_built]} != "${ver[${s}_checkout]}" ]] && ready+=("$s")
+  done
+  if (( ${#ready[@]} )); then
+    local which=${ready[0]}; (( ${#ready[@]} == 2 )) && which+=" and ${ready[1]}"
+    printf '%-14s %s\n' "Update" "ready for the $which: ./bridgekeep setup applies it"
+  fi
+}
+
+# portal_address: where to open the portal, from .env alone (works while it's down).
+# Same rule as the portal's own `info`: loopback is http://localhost, a network
+# address is HTTPS on the names saved by `portal network on`.
+portal_address() {
+  local port hosts first last
+  port=$(env_get PORTAL_PORT); port=${port:-8443}
+  if [[ -z $(env_get PORTAL_ADDRESS) ]]; then echo "http://localhost:$port"; return; fi
+  hosts=$(env_get PORTAL_HOSTS); hosts=${hosts:-$(env_get PORTAL_ADDRESS)}
+  first=${hosts%%,*}; last=${hosts##*,}
+  if [[ $first == "$last" ]]; then echo "https://$first:$port"
+  else echo "https://$first:$port or https://$last:$port"; fi
+}
+status_portal() {
+  local id state h addr
+  id=$(docker compose --profile portal ps -a -q portal 2>/dev/null | head -n1)
+  if [[ -z $id ]]; then
+    printf '%-14s %s\n' "Portal" "not set up (./bridgekeep setup --portal adds it)"; return
+  fi
+  addr=$(portal_address)
+  state=$(docker inspect -f '{{.State.Status}}' "$id" 2>/dev/null || echo missing)
+  h=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id" 2>/dev/null || true)
+  # Docker's own probe first runs a minute after start; asking the portal is quicker.
+  if [[ $state == running ]] && { [[ $h == healthy ]] || portal_answers; }; then
+    printf '%-14s %s\n' "Portal" "${G}up${N} at $addr"
+    if [[ -z $(env_get PORTAL_ADDRESS) ]]; then
+      printf '%-14s %s\n' "" "${D}this computer only; ./bridgekeep portal network on opens it to your network${N}"
+    fi
+  elif [[ $state == running && $h == starting ]]; then
+    printf '%-14s %s\n' "Portal" "starting (up in under a minute) at $addr"
+  elif [[ $state == running ]]; then
+    printf '%-14s %s\n' "Portal" "${R}down${N}: running but not answering at $addr"
+    printf '%-14s %s\n' "" "Fix: docker compose --profile portal restart portal, then ./bridgekeep status"
+  else
+    printf '%-14s %s\n' "Portal" "${R}down${N}: stopped (it would be at $addr)"
+    printf '%-14s %s\n' "" "Fix: ./bridgekeep setup --portal"
+  fi
+}
+
+analyzer_running() { docker compose --profile analyzer ps -q analyzer 2>/dev/null | grep -q .; }
+# Older mail: the backfill job (/data/backfill.json), or how much was left alone.
+# backfill_kv: the job's fields as key=value lines, read inside the analyzer.
+backfill_kv() {
+  docker compose --profile analyzer exec -T analyzer python -P -c '
+import json
+try: j = json.load(open("/data/backfill.json"))
+except Exception: j = {}
+for k in ("id", "status", "reason", "processed", "selected", "spend_usd", "est_usd", "est_calls",
+          "fits_budget", "calls_that_fit", "settled_by_lists", "since", "until", "limit"):
+    v = j.get(k, "")
+    v = f"{v:.2f}" if isinstance(v, float) else ("" if v is None else str(v))
+    print(k + "=" + "".join(c for c in v if c.isprintable()))   # no terminal escapes
+' 2>/dev/null || true
+}
+status_backfill() {
+  local skipped=${1:-0} st k v
+  declare -A b=()
+  while IFS='=' read -r k v; do [[ -n $k ]] && b[$k]=$v; done < <(backfill_kv)
+  st=${b[status]:-none}
+  case $st in
+    estimating) printf '%-14s %s\n' "Older mail" "estimating the cost (./bridgekeep backfill status)" ;;
+    estimated)  printf '%-14s %s\n' "Older mail" "estimate ready: about \$${b[est_usd]} for ${b[est_calls]} model calls"
+                printf '%-14s %s\n' "" "Run it: ./bridgekeep backfill start ${b[id]}$([[ ${b[fits_budget]} == False ]] && echo ' --allow-partial')" ;;
+    running|paused)
+                printf '%-14s %s\n' "Older mail" "$st: ${b[processed]} of ${b[selected]}, \$${b[spend_usd]} so far${b[reason]:+; ${b[reason]}}" ;;
+    done)       printf '%-14s %s\n' "Older mail" "done: ${b[processed]} messages, \$${b[spend_usd]}" ;;
+    *) if [[ $skipped =~ ^[0-9]+$ ]] && (( skipped > 0 )); then
+         printf '%-14s %s\n' "Older mail" "$skipped messages from before setup left alone. To analyze them: ./bridgekeep backfill estimate"
+       fi ;;
+  esac
+}
+# Before start: say exactly what leaves this computer, and ask (or --yes).
+BF_ARGS=()
+backfill_confirm() {
+  local a yes=false k v n dest
+  BF_ARGS=()
+  for a in "$@"; do if [[ $a == --yes || $a == -y ]]; then yes=true; else BF_ARGS+=("$a"); fi; done
+  declare -A b=()
+  while IFS='=' read -r k v; do [[ -n $k ]] && b[$k]=$v; done < <(backfill_kv)
+  # Anything the analyzer will refuse (wrong id, no estimate, over budget without
+  # --allow-partial) goes straight through, so its own reason is what's shown.
+  if [[ ${b[status]:-} != estimated || ${b[id]:-} != "${BF_ARGS[1]:-}" ]]; then return 0; fi
+  if [[ ${b[fits_budget]:-} == False ]] && [[ " ${BF_ARGS[*]} " != *" --allow-partial "* ]]; then return 0; fi
+  n=${b[est_calls]:-0}
+  [[ ${b[fits_budget]} == False ]] && n="${b[calls_that_fit]:-?} (of ${b[est_calls]}, what fits this month's budget; the rest from next month)"
+  say ""
+  # Who receives it: the same names as the portal's Older mail page.
+  case $(docker compose --profile analyzer exec -T analyzer cat /data/health.json 2>/dev/null | tr -d '\n' | json_field provider) in
+    openai) dest="OpenAI's API" ;;
+    gemini) dest="Google's Gemini API" ;;
+    local)  dest="your own server" ;;
+    anthropic) dest="Anthropic's API (Claude)" ;;
+    *)      dest="the AI vendor set on the portal's Analyzer page" ;;   # never guess
+  esac
+  say "  This sends ${B}$n older messages${N} to $dest, one at a time: sender"
+  say "  name and address, subject, link domains, attachment types and the first 3,000 characters"
+  say "  of each body. Of the ${b[selected]:-?} in range, ${b[settled_by_lists]:-0} are settled by your lists and not sent."
+  say "  Nothing is moved or deleted (log-only)."
+  say "  Mail from ${b[since]:-the oldest message} to ${b[until]:-setup}${b[limit]:+, at most ${b[limit]} messages}. Estimated cost: about \$${b[est_usd]:-?}."
+  say ""
+  $yes && return 0
+  [[ -t 0 ]] || { say "  Not started. To confirm without a prompt, add --yes."; return 1; }
+  ask N "Start it?" || { say "  Not started."; return 1; }
+}
+# Settings the analyzer ignored (bad values from the portal or analyzer.yaml).
+status_settings() {
+  local probs n
+  probs=$(docker compose --profile analyzer exec -T analyzer python -P -c '
+import json
+try: p = json.load(open("/data/health.json")).get("settings_problems") or []
+except Exception: p = []
+for x in p[:20]: print("".join(c for c in " ".join(str(x).split()) if c.isprintable())[:160])   # no terminal escapes
+' 2>/dev/null || true)
+  [[ -n $probs ]] || return 0
+  n=$(wc -l <<<"$probs")
+  printf '%-14s %s\n' "Settings" "${R}$n ignored${N} (see the portal's Analyzer page): $(head -n1 <<<"$probs")"
+}
+cmd_feedback() {
+  load_env
+  analyzer_running || { say "The analyzer isn't running. Set it up with: ./bridgekeep setup --analyzer"; exit 1; }
+  docker compose --profile analyzer exec -T -e BRIDGEKEEP_CLI=./bridgekeep analyzer \
+    python -P -m analyzer feedback "$@"
+}
+cmd_analyzer() { # analyzer shadow: the safe direction, so no confirmation (live is only switched on in the portal)
+  load_env
+  [[ ${1:-} == shadow ]] || { say "usage: ./bridgekeep analyzer shadow   (live mode is switched on in the portal)"; exit 2; }
+  local d name
+  d=$(portal_config_dir); d=${d:-/var/lib/bridgekeep/portal-config}
+  if as_root test -L "$d" || ! as_root test -d "$d"; then
+    say "There's no portal settings folder at $d, so the analyzer can't be in live mode. Nothing to do."; return 0
+  fi
+  # The folder belongs to the portal's user: never follow a link in it. dd
+  # creates the file new (excl, nofollow); rename never follows a link either.
+  name=".mode.$$.$RANDOM"
+  printf '{"mode": "shadow", "ts": %s, "by": "host"}\n' "$(date +%s)" \
+    | as_root sh -c 'umask 037 && dd of="$1" oflag=nofollow conv=excl status=none' sh "$d/$name" \
+    || fail "Couldn't write $d/mode.json." "sudo ./bridgekeep analyzer shadow"
+  as_root chgrp -h 10002 "$d/$name" && as_root mv -fT -- "$d/$name" "$d/mode.json" \
+    || { as_root rm -f -- "$d/$name"; fail "Couldn't write $d/mode.json." "sudo ./bridgekeep analyzer shadow"; }
+  ok "The analyzer is back in shadow mode: it logs what it would do and moves nothing."
+  note "It takes effect within a minute. Mail it moved already stays in AI-Review and AI-Quarantine;"
+  note "mark it Not spam in the portal to move it back."
+}
+cmd_backfill() {
+  load_env
+  analyzer_running || { say "The analyzer isn't running. Set it up with: ./bridgekeep setup --analyzer"; exit 1; }
+  [[ $# -gt 0 ]] || set -- status
+  if [[ $1 == start ]]; then backfill_confirm "$@" || exit 0; set -- "${BF_ARGS[@]}"; fi
+  docker compose --profile analyzer exec -T -e BRIDGEKEEP_CLI=./bridgekeep analyzer \
+    python -P -m analyzer backfill "$@"
+}
+
+usage() { # the header comment from line $1 up to the "setup is safe" paragraph
+  sed -n "$1,/^# setup is safe/p" "$0" | sed '$d' | sed -e '$d' -e 's/^# \{0,1\}//'
+}
+
+human() { # bytes -> 1.2 GB (decimal units, like most disk tools)
+  awk -v b="${1:-0}" 'BEGIN { split("B KB MB GB TB", u); i = 1; while (b >= 1000 && i < 5) { b /= 1000; i++ }
+    printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'
+}
+status_storage() {
+  local st k v; declare -A g=()
+  st=$(bash scripts/storage.sh 2>/dev/null) || { printf '%-14s %s\n' "Storage" "couldn't measure (needs root)"; return; }
+  while IFS='=' read -r k v; do g[$k]=$v; done <<<"$st"
+  say ""
+  say "Storage"
+  printf '  %-12s %s\n' "Mail (Bridge)" "$(human "${g[bridge_bytes]}")"
+  printf '  %-12s %s\n' "Analyzer" "$(human "${g[analyzer_bytes]}")"
+  (( ${g[portal_bytes]:-0} > 0 )) && printf '  %-12s %s\n' "Portal" "$(human "${g[portal_bytes]}")"
+  printf '  %-12s %s\n' "Images" "$(human "${g[images_bytes]}")"
+  local line; line="$(human "${g[disk_free_bytes]}") free of $(human "${g[disk_total_bytes]}") on ${g[disk_path]}"
+  if [[ ${g[low]} == yes ]]; then
+    printf '  %-12s %s%s%s\n' "Disk" "$R" "$line: low. Free some space, or Bridge will stop syncing when it runs out." "$N"
+  else
+    printf '  %-12s %s\n' "Disk" "$line"
+  fi
+}
+
+cmd_doctor() {
+  load_env
+  local bad=0 res
+  check() { if eval "$2" >/dev/null 2>&1; then ok "$1"; else printf '  %s✗%s %s\n    Fix: %s\n' "$R" "$N" "$1" "$3"; bad=1; fi; }
+  check "Docker, Compose and buildx" "bash scripts/preflight.sh" "bash scripts/preflight.sh (it prints the exact fix)"
+  check "Bridge image built" "docker image inspect $IMAGE:local" "./bridgekeep setup"
+  check "Bridge running and healthy" '[[ $(bridge_health) == healthy ]]' "./bridgekeep logs, then docker compose up -d"
+  check "Saved credentials" '[[ -n $(username) ]] && has_secret bridge_password' "./bridgekeep relogin"
+  if [[ ! -f bridge-cert.pem ]]; then printf '  %s✗%s Certificate not saved yet\n    Fix: ./bridgekeep setup\n' "$R" "$N"; bad=1
+  else
+    local pin=0; cert_pinned || pin=$?
+    if (( pin == 0 )); then ok "Bridge serves the saved certificate"
+    elif (( pin == 2 )); then printf '  %s✗%s Couldn'"'"'t read Bridge'"'"'s certificate (is it running?)\n    Fix: ./bridgekeep logs\n' "$R" "$N"; bad=1
+    else printf '  %s✗%s Bridge serves a different certificate from bridge-cert.pem\n    Fix: %s\n' "$R" "$N" "$cert_fix"; bad=1; fi
+  fi
+  if res=$(login_check 2>/dev/null); then ok "Real IMAP sign-in as $(username)"
+  else printf '  %s✗%s Real IMAP sign-in: %s\n    Fix: ./bridgekeep relogin\n' "$R" "$N" "$(json_field error <<<"$res")"; bad=1; fi
+  check "Daily updates scheduled" "update_scheduled" "./bridgekeep setup"
+  if portal_running; then
+    check "Portal answering" '[[ $(portal_health) == healthy ]]' "docker compose --profile portal logs portal"
+    # Docker 28 is the first to honour the portal network's no-internet settings.
+    check "Docker 28 or later (portal network isolation)" \
+      '(( $(docker version -f "{{.Server.Version}}" | cut -d. -f1) >= 28 ))' "update Docker Engine"
+  fi
+  return $bad
+}
+
+cmd_credentials() {
+  load_env
+  has_secret bridge_password || { say "No saved credentials yet. Run ./bridgekeep setup."; exit 1; }
+  [[ -t 0 && -t 1 ]] || { say "credentials only prints to a terminal, so the password can't end up in a pipe or a log."; exit 1; }
+  local smtp=""
+  docker compose exec -T bridge printenv FORWARD_SMTP 2>/dev/null | grep -qx true && smtp=", SMTP bridge:1025"
+  say "For mail apps and other containers (IMAP bridge:1143$smtp, STARTTLS):"
+  say "  Username: $(username)"
+  ask N "Show the password? It's not your Proton password, and it opens your whole mailbox." || exit 0
+  printf '  Password: '; as_root cat "$SECRETS/bridge_password"; echo
+  say "Nothing above was logged."
+}
+
+cmd_relogin() {
+  load_env
+  [[ -t 0 ]] || { say "relogin needs an interactive terminal."; exit 1; }
+  sign_in
+  s6_start
+}
+
+case ${1:-help} in
+  setup)       shift; cmd_setup "$@" ;;
+  status)      cmd_status ;;
+  doctor)      cmd_doctor ;;
+  credentials) cmd_credentials ;;
+  relogin)     cmd_relogin ;;
+  logs)        load_env; docker compose logs -f --tail 100 bridge ;;
+  update)      load_env; bash scripts/auto-update.sh ;;
+  deploy-update) load_env
+               if is_paused bridge; then say "Bridge is paused; ./bridgekeep start bridge first."; exit 1; fi
+               bash scripts/auto-update.sh --deploy ;;
+  portal)      shift; cmd_portal "$@" ;;
+  backfill)    shift; cmd_backfill "$@" ;;
+  feedback)    shift; cmd_feedback "$@" ;;
+  analyzer)    shift; cmd_analyzer "$@" ;;
+  watch)       cmd_watch ;;
+  stop|start)  cmd_stop_start "$@" ;;
+  alerts)      shift; cmd_alerts "$@" ;;
+  help|-h|--help) usage 2 ;;
+  *) say "unknown command '$1'"; usage 4; exit 2 ;;
+esac

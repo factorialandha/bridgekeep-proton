@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+[[ $* == --print-architecture ]] && { echo "$MOCK_ARCH"; exit; }
+exec /usr/bin/dpkg "$@"

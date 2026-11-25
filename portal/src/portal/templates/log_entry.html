@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% from "_macros.html" import action, confidence, subject, verdict_badge %}
+{% block title %}Log entry{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/log">Log</a> / Entry</p>
+{% if row is none %}
+<h1>Not found</h1><p>That entry may have been removed by the log's retention limit.</p>
+{% else %}
+<h1 class="subject">{{ subject(row) }}</h1>
+<p>{{ action(row) }} {{ verdict_badge(verdict) }}</p>
+<table class="rows">
+  <tbody>
+  <tr><th scope="row">From</th><td class="mono">{{ row.from_addr }}</td></tr>
+  <tr><th scope="row">Received</th><td>{{ row.ts | when }}</td></tr>
+  <tr><th scope="row">Why</th><td>{{ row.explain }}</td></tr>
+  <tr><th scope="row">Model said</th><td>{% if row.label %}{{ row.label }}, {{ confidence(row) }}{% if row.reason %}<br><span class="sub">“{{ row.reason }}”</span>{% endif %}{% else %}<span class="sub">Not asked (a rule decided first)</span>{% endif %}</td></tr>
+  <tr><th scope="row">Authentication</th><td>{% if row.verified %}<span class="badge safe">✓ DMARC verified</span>{% else %}<span class="badge review">! Not verified</span>{% endif %}</td></tr>
+  {% if row.injections %}
+  <tr><th scope="row">Injection flag</th><td>
+    <span class="badge trash">✗ Text aimed at AI filters</span>
+    <ul class="plain">{% for i in row.injections %}<li class="mono">{{ i }}</li>{% endfor %}</ul>
+  </td></tr>
+  {% endif %}
+  {% if row.error %}<tr><th scope="row">Error</th><td class="mono">{{ row.error }}</td></tr>{% endif %}
+  </tbody>
+</table>
+<section class="actions">
+  <h2>{{ "Spam or not?" if row.action == "review" else "Was this right?" }}</h2>
+  <p class="sub">{% if row.action == "review" %}The analyzer wasn't sure about this one.{% else %}If the analyzer got this wrong, tell it.{% endif %} Shadow mode moves nothing. Your answer measures the analyzer before live mode. It also teaches it: after two "Not spam" answers for a sender whose mail is signed, and no "Spam" answers, the analyzer won't trash their mail any more. At most it asks you.</p>
+  <form method="post" action="/review/verdict" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ row.id }}"><input type="hidden" name="from" value="entry">
+    <button name="verdict" value="keep" {{ 'aria-pressed="true"' if verdict == "keep" }}>Not spam (keep)</button>
+    <button name="verdict" value="trash" {{ 'aria-pressed="true"' if verdict == "trash" }}>Spam (trash)</button>
+    {% if verdict %}<button name="verdict" value="undo" class="ghost">Clear my answer</button>{% endif %}
+  </form>
+  {% if row.from_addr %}
+  <p class="sender-lists">This sender: <a href="/lists?add=protect:address&amp;value={{ row.from_addr | urlencode }}#add">Never trash</a> · <a href="/lists?add=block:address&amp;value={{ row.from_addr | urlencode }}#add">Always trash</a></p>
+  {% endif %}
+  {% if verdict %}<p class="hint">Clearing removes your answer and what the analyzer learned from it. If it was one of the two "Not spam" answers that protect this sender, their next mail can be marked spam again. Mail already decided stays as it is.</p>{% endif %}
+</section>
+{% if unsub %}
+<section class="actions" id="unsubscribe">
+  <h2>Unsubscribe</h2>
+  {% if unsub.method == "one_click" %}
+  <p class="sub">This sender offers a one-click unsubscribe that Bridgekeep checked is safe to use.</p>
+  <form method="post" action="/unsubscribe" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="id" value="{{ row.id }}">
+    <button>Unsubscribe…</button>
+  </form>
+  {% else %}
+  <p>To unsubscribe, send an email to <span class="mono">{{ unsub.mailto }}</span> from your mail app. Bridgekeep never sends mail for you.</p>
+  {% endif %}
+</section>
+{% endif %}
+<details><summary>Decision record</summary>
+<table class="rows mono small"><tbody>
+  <tr><th scope="row">Rule</th><td>{{ row.rule }}</td></tr>
+  <tr><th scope="row">Mode</th><td>{{ row.mode }}</td></tr>
+  <tr><th scope="row">Model</th><td>{{ row.model }}</td></tr>
+  <tr><th scope="row">Prompt version</th><td>{{ row.prompt_version }}</td></tr>
+  <tr><th scope="row">Message key</th><td>{{ row.key }}</td></tr>
+</tbody></table>
+</details>
+{% endif %}
+{% endblock %}

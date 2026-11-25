@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Stand-in for curl in tests/notify.sh: records the config curl got on stdin
+# and its arguments, and succeeds unless MOCK_CURL_FAIL is set.
+cat >>"$MOCK_CURL_LOG"
+printf 'ARGS %s\n' "$*" >>"$MOCK_CURL_LOG"
+[[ -z ${MOCK_CURL_FAIL:-} ]]

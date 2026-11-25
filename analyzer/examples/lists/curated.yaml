@@ -1,0 +1,31 @@
+# Never-trash list and blocklist. Only you edit this file; keep it in a
+# private Git repo and mount it read-only. Every entry needs a reason.
+#
+#   analyzer lists lint --lists examples/lists
+
+protect:
+  - address: billing@mybank.example
+    reason: Bank statements
+    added: 2026-11-23
+  - domain: employer.example
+    subdomains: true          # also mail.employer.example etc.
+    reason: Work
+    expires: 2027-06-30
+  # Free-mail domains (gmail.com, outlook.com...) can only be exact addresses:
+  - address: alice@gmail.com
+    reason: Sister
+
+# Subject words that must never be quarantined. A match does not skip the
+# model: phishing that uses these words still goes to review with a warning.
+keywords:
+  - pattern: verification code
+    reason: Security codes
+  - pattern: password reset
+    reason: Account recovery
+  - pattern: invoice
+    reason: Money
+
+# Exact addresses only. Matched only when DMARC passes; the never-trash list wins.
+block:
+  - address: offers@spam-sender.example
+    reason: Marked as junk 3 times

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="same-origin">
+<title>{% block title %}{% endblock %} · {{ product }}</title>
+<link rel="stylesheet" href="{{ asset('portal.css') }}">
+<link rel="icon" href="{{ asset('icon.svg') }}" type="image/svg+xml">
+<script src="{{ asset('portal.js') }}" defer></script>
+{% block head %}{% endblock %}
+</head>
+<body class="{% if signed_in %}app{% else %}gate{% endif %}">
+{% if signed_in %}
+<header class="top">
+  <a class="brand" href="/"><img src="{{ asset('icon.svg') }}" alt="" width="22" height="22"><span>{{ product }}</span></a>
+  <div class="top-actions">
+    <button type="button" class="theme" data-theme-toggle>Theme: System</button>
+    <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="ghost">Sign out</button></form>
+  </div>
+</header>
+{% if lan_nudge %}
+<div class="banner banner-warn" role="note">Your home network can reach this portal and sign-in needs only your password. <a href="/settings#authenticator">Add an authenticator</a></div>
+{% endif %}
+{% if health and health.state != "not_set_up" %}
+<div class="banner banner-{{ 'live' if health.mode == 'live' else 'dry' }}" role="status">
+  {% if health.mode == "live" %}Live: the analyzer moves mail{% else %}Shadow mode: nothing is being moved{% endif %}
+</div>
+{% endif %}
+<div class="shell">
+  <nav class="rail" aria-label="Main">
+    <a href="/" {% if path == "/" %}aria-current="page"{% endif %}><span class="ico" aria-hidden="true">◉</span>Status</a>
+    <a href="/review" {% if path == "/review" %}aria-current="page"{% endif %}><span class="ico" aria-hidden="true">◧</span>Review{% if review_waiting %} <span class="count"><span aria-hidden="true">{{ review_waiting if review_waiting < 100 else "99+" }}</span><span class="vh">, {{ review_waiting }} waiting</span></span>{% endif %}</a>
+    <a href="/log" {% if path.startswith("/log") %}aria-current="page"{% endif %}><span class="ico" aria-hidden="true">☰</span>Log</a>
+    <a href="/lists" {% if path.startswith("/lists") %}aria-current="page"{% endif %}><span class="ico" aria-hidden="true">✓</span>Lists</a>
+    <a class="wide" href="/analyzer" {% if path.startswith("/analyzer") or path == "/backfill" %}aria-current="page"{% endif %}><span class="ico" aria-hidden="true">◎</span>Analyzer</a>
+    <a class="wide" href="/settings" {% if path in ("/settings", "/audit") %}aria-current="page"{% endif %}><span class="ico" aria-hidden="true">⚙</span>Settings</a>
+    {# Phones: at most 5 tabs, the rest under More #}
+    <a class="narrow" href="/more" {% if path == "/more" or path.startswith("/analyzer") or path in ("/backfill", "/settings", "/audit") %}aria-current="page"{% endif %}><span class="ico" aria-hidden="true">⋯</span>More</a>
+  </nav>
+  <main id="main">{% block main %}{% endblock %}
+  <footer class="foot sub">{% include "_versions.html" %}</footer>
+  </main>
+</div>
+{% else %}
+<main class="gate-card" id="main">
+  <div class="brand gate-brand"><img src="{{ asset('icon.svg') }}" alt="" width="28" height="28"><span>{{ product }}</span></div>
+  {% block gate %}{% endblock %}
+</main>
+{% endif %}
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Your own never-trash list, blocklist and protected subject words.
+# The admin portal's Lists page is the easy way to manage these; entries here
+# show up there as "From your file" and can be removed from the portal too.
+# Every entry needs a reason. Example: analyzer/examples/lists/curated.yaml
+protect: []
+keywords: []
+block: []

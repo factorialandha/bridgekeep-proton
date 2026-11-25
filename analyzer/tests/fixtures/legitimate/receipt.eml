@@ -1,0 +1,17 @@
+Authentication-Results: mailin021.protonmail.ch; dkim=pass header.d=shop.example header.s=s1; dmarc=pass (p=reject dis=none) header.from=shop.example; spf=pass smtp.mailfrom=shop.example
+From: Shop <orders@shop.example>
+To: owner@example.org
+Subject: Your order #1234 has shipped
+Message-ID: <r1@shop.example>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary=b1
+
+--b1
+Content-Type: text/plain
+
+Your order has shipped. Track it at https://shop.example/track/1234
+--b1
+Content-Type: text/html
+
+<html><body><p>Your order has shipped.</p><p><a href="https://shop.example/track/1234">Track it</a></p><p style="color:#666">Shop Inc.</p></body></html>
+--b1--

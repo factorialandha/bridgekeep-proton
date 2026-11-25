@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Create admin{% endblock %}
+{% block gate %}
+<h1>Secure the portal</h1>
+<p class="lead">Choose the password you'll sign in with. Adding an authenticator app makes it much harder for anyone else to get in.</p>
+{% include "_error.html" %}
+<form method="post" action="/claim/admin" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}">
+  <fieldset>
+    <legend>1. Choose a password</legend>
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" autocomplete="new-password" minlength="12" required>
+    <label for="confirm">Type it again</label>
+    <input id="confirm" name="confirm" type="password" autocomplete="new-password" minlength="12" required>
+    <p class="hint">At least 15 characters, or 12 with an authenticator. A few unrelated words work well. Don't reuse your Proton password.</p>
+  </fieldset>
+  <fieldset>
+    <legend>2. Add an authenticator <span class="sub">(recommended, optional)</span></legend>
+    <p>Scan this with an authenticator app (Proton Pass, Aegis, 1Password, Google Authenticator…), then enter the code it shows. To skip, leave the code empty. You can add it later in Settings.</p>
+    <div class="qr">{{ qr }}</div>
+    <details><summary>Can't scan? Enter the key by hand</summary><p class="mono secret">{{ secret }}</p></details>
+    <label for="code">Code from the app</label>
+    <input id="code" name="code" class="mono" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7">
+  </fieldset>
+  <button class="primary">Create admin and continue</button>
+</form>
+{% endblock %}

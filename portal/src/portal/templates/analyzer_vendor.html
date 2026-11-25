@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}AI vendor{% endblock %}
+{% block main %}
+<p class="crumbs"><a href="/analyzer">Analyzer</a> / AI vendor</p>
+<h1>AI vendor</h1>
+<p class="lead">Who the analyzer asks about each new message. Your lists and the built-in rules work the same whichever you choose.</p>
+{% if done == "sent" %}<p class="ok" role="status">✓ Sent to the host. It's applied within 5 minutes, and your Discord channel (if set up) is told first.</p>{% endif %}
+{% include "_error.html" %}
+<p>
+  Now: <strong>{{ current.label or current.provider }}</strong>{% if current.model %}, <code>{{ current.model }}</code>{% endif %}
+  {% if state.pending %}<span class="badge review">! Change waiting for the host</span> <span class="sub">Applied within 5 minutes.</span>
+  {% elif state.when %}<span class="sub">· last changed {{ state.when | ago }}</span>{% endif %}
+</p>
+{% if no_price %}<p class="nudge" role="alert">The analyzer isn't using this model yet: it needs the model's prices to keep to your budget. Type them below.</p>{% endif %}
+{% if state.result and state.result != "ok" and not state.pending %}<p class="nudge" role="alert">The host didn't apply the last change: {{ state.result[9:] if state.result.startswith("refused: ") else state.result }}. Change it below and continue again.</p>{% endif %}
+
+<form method="post" action="/analyzer/vendor/review" class="narrow" autocomplete="off">
+  <input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="back" value="/analyzer/vendor">
+  <label for="provider">Vendor</label>
+  <select id="provider" name="provider">
+    {% for value, v in vendors.items() %}<option value="{{ value }}" {{ "selected" if form.get("provider") == value }}>{{ v.label }}</option>{% endfor %}
+  </select>
+  <label for="model">Model name</label>
+  <input id="model" name="model" maxlength="100" spellcheck="false" value="{{ form.get('model', '') }}">
+  <p class="hint">Type it exactly as your vendor's console or your server shows it.</p>
+  <ul class="hint">
+    {% for value, v in vendors.items() %}<li>{{ v.label.split(" (")[0] }}: {{ v.model_hint }}</li>
+    {% endfor %}
+  </ul>
+
+  <h2 class="section">Your own server only</h2>
+  <label for="endpoint">Server address</label>
+  <input id="endpoint" name="endpoint" maxlength="300" spellcheck="false" value="{{ form.get('endpoint', '') }}" placeholder="http://192.168.1.20:11434/v1">
+  <p class="hint">An OpenAI-compatible address on your own network. A name is looked up once and its address is kept. It can't be Bridgekeep's own services.</p>
+
+  <h2 class="section">Prices (US$ per million tokens)</h2>
+  <label for="price_in">Input</label>
+  <input id="price_in" name="price_in" inputmode="decimal" maxlength="12" value="{{ form.get('price_in', '') }}">
+  <label for="price_out">Output</label>
+  <input id="price_out" name="price_out" inputmode="decimal" maxlength="12" value="{{ form.get('price_out', '') }}">
+  <p class="hint">Needed for OpenAI and Gemini, from their pricing page: prices change and differ by plan, and the analyzer only uses a model it can keep to your budget. Not needed for claude-haiku-5-5 or your own server. To change only the prices, keep the same vendor and model.</p>
+
+  <p class="hint">Next you'll see who receives your mail and can type the API key. Continuing asks for your password if you haven't confirmed it in the last 5 minutes.</p>
+  <button class="primary" {{ "disabled" if not drop_writable or state.pending }}>Continue</button>
+</form>
+{% if not drop_writable %}<p class="sub">Run <code>./bridgekeep setup</code> on the host to enable this.</p>{% endif %}
+{% endblock %}

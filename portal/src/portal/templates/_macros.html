@@ -1,0 +1,19 @@
+{% macro action(r) -%}
+{% if r.moved_back %}<span class="badge safe">↩ Moved back</span>{% else -%}
+{% if r.action == "quarantine" %}<span class="badge trash">{% if r.applied %}✗ Moved to {{ r.moved_to or "AI-Quarantine" }}{% else %}<em>Would trash</em>{% endif %}</span>
+{%- elif r.action == "review" %}<span class="badge review">{% if r.applied %}! Moved to {{ r.moved_to or "AI-Review" }}{% else %}<em>Would review</em>{% endif %}</span>
+{%- else %}<span class="badge safe">✓ Kept</span>{% endif %}
+{%- endif %}
+{%- endmacro %}
+
+{% macro confidence(r) -%}
+{% if r.confidence is not none %}<span class="conf"><span class="num">{{ "%.2f" | format(r.confidence) }}</span><meter min="0" max="1" low="0.7" high="0.97" optimum="0" value="{{ r.confidence }}" aria-hidden="true"></meter></span>{% else %}<span class="sub">—</span>{% endif %}
+{%- endmacro %}
+
+{% macro subject(r) -%}
+{% if r.subject is none %}<span class="sub">(subject not stored)</span>{% elif r.subject == "" %}<span class="sub">(no subject)</span>{% else %}{{ r.subject | truncate(90, True, "…") }}{% endif %}
+{%- endmacro %}
+
+{% macro verdict_badge(v) -%}
+{% if v == "keep" %}<span class="badge safe">You: not spam</span>{% elif v == "trash" %}<span class="badge trash">You: spam</span>{% endif %}
+{%- endmacro %}
